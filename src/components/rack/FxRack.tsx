@@ -1,11 +1,11 @@
-import React, { useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useEditor } from '../../state/editorState';
 import { Preset, Scene, Subscene, ParameterValue } from '../../domain/models';
 import { catalog } from '../../domain/catalog';
 import { resolveParameterState } from '../../domain/resolution';
 import { EFFECT_MODULES, getModuleParameters } from '../../domain/effectModules';
 import { FxCard } from './FxCard';
-import { SlidersHorizontal, Power } from 'lucide-react';
+import { SlidersHorizontal } from 'lucide-react';
 
 interface FxRackProps {
   preset?: Preset;
@@ -24,12 +24,38 @@ export const FxRack: React.FC<FxRackProps> = ({
 }) => {
   const { dispatch } = useEditor();
 
-  // Active overrides at the current level
+  // Single-expanded-module state across the rack
+  const [expandedModuleId, setExpandedModuleId] = useState<string | null>(null);
+
+  // Active sparse overrides at the current level
   const activeOverrides = useMemo(() => {
     if (currentLevel === 'subscene') return subscene?.parameters || {};
     if (currentLevel === 'scene') return scene?.parameters || {};
     return preset?.parameters || {};
   }, [currentLevel, subscene, scene, preset]);
+
+  // Set of all parameter names belonging to the 7 displayed effect modules (excludes tempo, key, scale)
+  const allRackParamNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const m of EFFECT_MODULES) {
+      if (m.enableParam) names.add(m.enableParam);
+      for (const p of getModuleParameters(m)) {
+        names.add(p.name);
+      }
+    }
+    return names;
+  }, []);
+
+  // Total customizations specifically within the FX rack
+  const totalCustomizedInRack = useMemo(() => {
+    let count = 0;
+    for (const key of Object.keys(activeOverrides)) {
+      if (allRackParamNames.has(key)) {
+        count++;
+      }
+    }
+    return count;
+  }, [activeOverrides, allRackParamNames]);
 
   // Resolve all parameters for the current context
   const resolvedState = useMemo(() => {
@@ -100,30 +126,14 @@ export const FxRack: React.FC<FxRackProps> = ({
   const handleResetModule = (moduleKey: string) => {
     const mod = EFFECT_MODULES.find((m) => m.id === moduleKey);
     if (!mod) return;
+    if (mod.enableParam && activeOverrides[mod.enableParam] !== undefined) {
+      handleResetParam(mod.enableParam);
+    }
     const params = getModuleParameters(mod);
     for (const p of params) {
       if (activeOverrides[p.name] !== undefined) {
         handleResetParam(p.name);
       }
-    }
-  };
-
-  // Global Actions: ALL ON and BYPASS (like CYD FxChainScreen)
-  const handleAllEffectsOn = () => {
-    const enableParams = EFFECT_MODULES.map((m) => m.enableParam).filter(
-      (p): p is string => Boolean(p)
-    );
-    for (const p of enableParams) {
-      handleParamChange(p, true);
-    }
-  };
-
-  const handleGlobalBypass = () => {
-    const enableParams = EFFECT_MODULES.map((m) => m.enableParam).filter(
-      (p): p is string => Boolean(p)
-    );
-    for (const p of enableParams) {
-      handleParamChange(p, false);
     }
   };
 
@@ -134,12 +144,10 @@ export const FxRack: React.FC<FxRackProps> = ({
         ? 'Sound'
         : 'Defaults';
 
-  const totalOverridesCount = Object.keys(activeOverrides).length;
-
   return (
-    <div className="space-y-4">
-      {/* Rack Global Action Bar */}
-      <div className="bg-[#101116] border border-[#292A30] rounded-[5px] p-3 flex flex-wrap items-center justify-between gap-3">
+    <div className="space-y-3.5">
+      {/* Rack Header */}
+      <div className="bg-[#101116] border border-[#292A30] rounded-[5px] px-4 py-2.5 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <span className="text-xs font-bold tracking-wider text-[#F0EDE5]">
             FX RACK
@@ -147,54 +155,35 @@ export const FxRack: React.FC<FxRackProps> = ({
           <span className="text-[11px] font-mono text-[#716E69]">
             7 modules
           </span>
-          {totalOverridesCount > 0 && (
+          {totalCustomizedInRack > 0 && (
             <span className="text-[10px] font-mono bg-[#FF6030]/20 text-[#FF6030] px-2 py-0.5 rounded-[3px] border border-[#FF6030]/40">
-              {totalOverridesCount} customized
+              {totalCustomizedInRack} customized
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        {onOpenAdvanced && (
           <button
             type="button"
-            onClick={handleAllEffectsOn}
-            className="h-8 px-3 rounded-[3px] bg-[#14151B] hover:bg-[#1C1D24] text-[#20D6C7] border border-[#292A30] hover:border-[#20D6C7] text-xs font-mono font-medium transition cursor-pointer flex items-center gap-1.5"
-            title="Enable all effect modules"
+            onClick={onOpenAdvanced}
+            className="h-7 px-2.5 rounded-[3px] bg-[#14151B] hover:bg-[#1C1D24] text-[#B1ACA3] hover:text-[#F0EDE5] border border-[#292A30] text-xs font-mono transition cursor-pointer flex items-center gap-1.5"
+            title="Open all 71 parameters inspector"
           >
-            <Power className="w-3.5 h-3.5" />
-            <span>ALL ON</span>
+            <SlidersHorizontal className="w-3.5 h-3.5 text-[#F45126]" />
+            <span className="hidden sm:inline">Advanced Parameters...</span>
           </button>
-
-          <button
-            type="button"
-            onClick={handleGlobalBypass}
-            className="h-8 px-3 rounded-[3px] bg-[#14151B] hover:bg-[#1C1D24] text-[#B1ACA3] hover:text-[#FF6030] border border-[#292A30] hover:border-[#F45126] text-xs font-mono font-medium transition cursor-pointer flex items-center gap-1.5"
-            title="Bypass all effect modules"
-          >
-            <span>BYPASS</span>
-          </button>
-
-          {onOpenAdvanced && (
-            <button
-              type="button"
-              onClick={onOpenAdvanced}
-              className="h-8 px-3 rounded-[3px] bg-[#1C1D24] hover:bg-[#202128] text-[#F0EDE5] border border-[#34343C] text-xs font-mono font-medium transition cursor-pointer flex items-center gap-1.5"
-              title="Open full parameter inspector"
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5 text-[#F45126]" />
-              <span className="hidden sm:inline">Advanced...</span>
-            </button>
-          )}
-        </div>
+        )}
       </div>
 
       {/* Rack Modules Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3.5 items-start">
         {EFFECT_MODULES.map((module) => {
           const modParams = getModuleParameters(module);
-          const customizedInMod = modParams.filter(
-            (p) => activeOverrides[p.name] !== undefined
-          ).length;
+          const customizedInMod =
+            (module.enableParam && activeOverrides[module.enableParam] !== undefined ? 1 : 0) +
+            modParams.filter((p) => activeOverrides[p.name] !== undefined).length;
+
+          const isExpanded = expandedModuleId === module.id;
 
           return (
             <FxCard
@@ -207,6 +196,10 @@ export const FxRack: React.FC<FxRackProps> = ({
               customizedCount={customizedInMod}
               contextLevel={currentLevel}
               parentContextName={parentContextName}
+              isExpanded={isExpanded}
+              onToggleExpand={() =>
+                setExpandedModuleId(isExpanded ? null : module.id)
+              }
             />
           );
         })}

@@ -10,6 +10,16 @@ export interface EffectModuleDefinition {
   readonly formatSummary: (values: Record<string, ParameterValue>) => string;
 }
 
+function getVal<T extends ParameterValue>(
+  values: Record<string, ParameterValue>,
+  paramName: string
+): T {
+  if (values[paramName] !== undefined && values[paramName] !== null) {
+    return values[paramName] as T;
+  }
+  return catalog.getDefaultValue(paramName) as T;
+}
+
 export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
   {
     id: 'harmony',
@@ -18,8 +28,8 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     enableParam: 'HarmonyEnable',
     primaryParams: ['HarmonyMode', 'HarmonyInterval', 'HarmonyLevel', 'HarmonyVoice1Pan'],
     formatSummary: (vals) => {
-      const mode = String(vals.HarmonyMode || 'Fixed');
-      const interval = typeof vals.HarmonyInterval === 'number' ? vals.HarmonyInterval : 0;
+      const mode = String(getVal(vals, 'HarmonyMode'));
+      const interval = Number(getVal(vals, 'HarmonyInterval'));
       const sign = interval > 0 ? '+' : '';
       return `${mode} ${sign}${interval}st`;
     },
@@ -36,9 +46,10 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
       'GateEnable',
     ],
     formatSummary: (vals) => {
-      const thresh = typeof vals.CompressorThresholdDb === 'number' ? vals.CompressorThresholdDb : -20;
-      const ratio = typeof vals.CompressorRatio === 'number' ? vals.CompressorRatio : 4;
-      return `${thresh}dB · ${ratio}:1`;
+      const thresh = Number(getVal(vals, 'CompressorThresholdDb'));
+      const ratio = Number(getVal(vals, 'CompressorRatio'));
+      const threshUnit = catalog.getParameter('CompressorThresholdDb')?.unit || '';
+      return `${thresh}${threshUnit} · ${ratio}:1`;
     },
   },
   {
@@ -48,8 +59,8 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     enableParam: 'DriveEnable',
     primaryParams: ['DriveMode', 'DriveDrive', 'DriveMix', 'DriveTone'],
     formatSummary: (vals) => {
-      const mode = String(vals.DriveMode || 'Tape');
-      const drive = typeof vals.DriveDrive === 'number' ? vals.DriveDrive : 0.5;
+      const mode = String(getVal(vals, 'DriveMode'));
+      const drive = Number(getVal(vals, 'DriveDrive'));
       return `${mode} · ${Math.round(drive * 100)}%`;
     },
   },
@@ -60,8 +71,8 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     enableParam: 'ChorusEnable',
     primaryParams: ['ChorusMode', 'ChorusRateHz', 'ChorusDepthMs', 'ChorusMix'],
     formatSummary: (vals) => {
-      const mode = String(vals.ChorusMode || 'Chorus');
-      const mix = typeof vals.ChorusMix === 'number' ? vals.ChorusMix : 0.5;
+      const mode = String(getVal(vals, 'ChorusMode'));
+      const mix = Number(getVal(vals, 'ChorusMix'));
       return `${mode} · ${Math.round(mix * 100)}%`;
     },
   },
@@ -72,9 +83,9 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     enableParam: 'DelayEnable',
     primaryParams: ['DelayLeftMs', 'DelayRightMs', 'DelayFeedback', 'DelayWet'],
     formatSummary: (vals) => {
-      const time = typeof vals.DelayLeftMs === 'number' ? vals.DelayLeftMs : 350;
-      const wet = typeof vals.DelayWet === 'number' ? vals.DelayWet : 0.2;
-      return `${Math.round(time)}ms · ${Math.round(wet * 100)}%`;
+      const leftMs = Number(getVal(vals, 'DelayLeftMs'));
+      const wet = Number(getVal(vals, 'DelayWet'));
+      return `${Math.round(leftMs)}ms · ${Math.round(wet * 100)}%`;
     },
   },
   {
@@ -84,8 +95,8 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     enableParam: 'ReverbEnable',
     primaryParams: ['ReverbWet', 'ReverbDecayS', 'ReverbDamping'],
     formatSummary: (vals) => {
-      const decay = typeof vals.ReverbDecayS === 'number' ? vals.ReverbDecayS : 2.5;
-      const wet = typeof vals.ReverbWet === 'number' ? vals.ReverbWet : 0.2;
+      const decay = Number(getVal(vals, 'ReverbDecayS'));
+      const wet = Number(getVal(vals, 'ReverbWet'));
       return `${decay.toFixed(1)}s · ${Math.round(wet * 100)}%`;
     },
   },
@@ -95,9 +106,9 @@ export const EFFECT_MODULES: readonly EffectModuleDefinition[] = [
     group: 'output',
     primaryParams: ['LimiterCeiling', 'OutputSpatialRouting', 'OutputSpatialSource', 'OutputMuteDry'],
     formatSummary: (vals) => {
-      const ceil = typeof vals.LimiterCeiling === 'number' ? vals.LimiterCeiling : -0.5;
-      const routing = String(vals.OutputSpatialRouting || 'Stereo');
-      return `${routing} · ${ceil.toFixed(1)}dB`;
+      const ceil = Number(getVal(vals, 'LimiterCeiling'));
+      const routing = String(getVal(vals, 'OutputSpatialRouting'));
+      return `${routing} · ${ceil.toFixed(2)}`;
     },
   },
 ];
@@ -110,7 +121,11 @@ export function getModuleParameters(
   module: EffectModuleDefinition,
   options?: { excludeEnable?: boolean }
 ) {
-  const allInGroup = catalog.getParametersByGroup(module.group);
+  let allInGroup = catalog.getParametersByGroup(module.group);
+  if (module.id === 'harmony') {
+    // HarmonyKey and HarmonyScale belong to the Song musical header, not the FX rack
+    allInGroup = allInGroup.filter((p) => p.name !== 'HarmonyKey' && p.name !== 'HarmonyScale');
+  }
   if (options?.excludeEnable && module.enableParam) {
     return allInGroup.filter((p) => p.name !== module.enableParam);
   }

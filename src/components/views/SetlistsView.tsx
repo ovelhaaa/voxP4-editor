@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useEditor } from '../../state/editorState';
 import { Setlist } from '../../domain/models';
+import { resolveSongMusicalAttributes } from '../../domain/musicalResolution';
 import {
   ListOrdered,
   Plus,
@@ -12,7 +13,7 @@ import {
 
 export const SetlistsView: React.FC = () => {
   const { state, dispatch } = useEditor();
-  const { setlists, scenes } = state.library;
+  const { setlists, scenes, presets } = state.library;
   const selection = state.selection;
 
   const activeSetlistId =
@@ -124,7 +125,7 @@ export const SetlistsView: React.FC = () => {
                       e.stopPropagation();
                       dispatch({ type: 'DELETE_SETLIST', setlistId: setlist.id });
                     }}
-                    className="p-1 text-[#716E69] hover:text-[#E65050] rounded opacity-0 group-hover:opacity-100 transition cursor-pointer"
+                    className="p-1 text-[#716E69] hover:text-[#E65050] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
                     title="Delete Setlist"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
@@ -218,8 +219,8 @@ export const SetlistsView: React.FC = () => {
             <div className="space-y-2">
               {currentSetlist.entries.map((entry, idx) => {
                 const scene = scenes.find((s) => s.id === entry.sceneId);
-                const tempo = scene?.parameters?.TempoBpm ?? 120;
-                const key = scene?.parameters?.HarmonyKey ?? 'C';
+                const scenePreset = presets.find((p) => p.id === scene?.basePresetId);
+                const musicalAttrs = resolveSongMusicalAttributes(scene, scenePreset);
 
                 return (
                   <div
@@ -239,9 +240,9 @@ export const SetlistsView: React.FC = () => {
                           </span>
                         </div>
                         <div className="text-[11px] text-[#716E69] font-mono flex items-center gap-2 mt-0.5">
-                          <span className="text-[#20D6C7]">{tempo} BPM</span>
+                          <span className="text-[#20D6C7]">{musicalAttrs.tempo} BPM</span>
                           <span>·</span>
-                          <span className="text-[#20D6C7]">Key {String(key)}</span>
+                          <span className="text-[#20D6C7]">Key {musicalAttrs.key}</span>
                           <span>·</span>
                           <span>{scene?.subscenes?.length || 0} sections</span>
                         </div>
@@ -253,7 +254,7 @@ export const SetlistsView: React.FC = () => {
                         type="button"
                         disabled={idx === 0}
                         onClick={() => handleReorder(idx, 'up')}
-                        className="p-1.5 text-[#716E69] hover:text-[#F0EDE5] disabled:opacity-20 rounded-[3px] hover:bg-[#1C1D24] transition cursor-pointer"
+                        className="p-1.5 text-[#716E69] hover:text-[#F0EDE5] disabled:opacity-20 rounded-[3px] hover:bg-[#1C1D24] opacity-70 hover:opacity-100 transition cursor-pointer"
                         title="Move up"
                       >
                         <ArrowUp className="w-4 h-4" />
@@ -262,7 +263,7 @@ export const SetlistsView: React.FC = () => {
                         type="button"
                         disabled={idx === currentSetlist.entries.length - 1}
                         onClick={() => handleReorder(idx, 'down')}
-                        className="p-1.5 text-[#716E69] hover:text-[#F0EDE5] disabled:opacity-20 rounded-[3px] hover:bg-[#1C1D24] transition cursor-pointer"
+                        className="p-1.5 text-[#716E69] hover:text-[#F0EDE5] disabled:opacity-20 rounded-[3px] hover:bg-[#1C1D24] opacity-70 hover:opacity-100 transition cursor-pointer"
                         title="Move down"
                       >
                         <ArrowDown className="w-4 h-4" />
@@ -276,7 +277,7 @@ export const SetlistsView: React.FC = () => {
                             entryId: entry.id,
                           })
                         }
-                        className="p-1.5 text-[#716E69] hover:text-[#E65050] rounded-[3px] hover:bg-[#1C1D24] transition cursor-pointer ml-1"
+                        className="p-1.5 text-[#716E69] hover:text-[#E65050] rounded-[3px] hover:bg-[#1C1D24] opacity-70 hover:opacity-100 transition cursor-pointer ml-1"
                         title="Remove from setlist"
                       >
                         <Trash2 className="w-4 h-4" />

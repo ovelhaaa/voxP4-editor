@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useEditor } from '../../state/editorState';
 import { Scene } from '../../domain/models';
 import { catalog } from '../../domain/catalog';
+import { resolveSongMusicalAttributes } from '../../domain/musicalResolution';
 import { FxRack } from '../rack/FxRack';
 import {
   Plus,
@@ -13,6 +14,9 @@ import {
   Music,
   Sliders,
   Sparkles,
+  ChevronDown,
+  ChevronUp,
+  RotateCcw,
 } from 'lucide-react';
 
 interface SongsViewProps {
@@ -43,8 +47,14 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
   );
 
   const [activeSongMenu, setActiveSongMenu] = useState<string | null>(null);
+  const [showMetadataDetails, setShowMetadataDetails] = useState(false);
 
   const quickSections = ['Intro', 'Verse', 'Chorus', 'Bridge', 'Solo', 'Outro'];
+
+  // Catalog descriptors for musical parameters
+  const tempoDesc = catalog.getParameter('TempoBpm');
+  const keyDesc = catalog.getParameter('HarmonyKey');
+  const scaleDesc = catalog.getParameter('HarmonyScale');
 
   if (!currentScene) {
     return (
@@ -67,13 +77,8 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
 
   const basePreset = presets.find((p) => p.id === currentScene.basePresetId);
 
-  // Musical attributes
-  const tempoVal =
-    typeof currentScene.parameters?.TempoBpm === 'number'
-      ? currentScene.parameters.TempoBpm
-      : 120;
-  const keyVal = String(currentScene.parameters?.HarmonyKey ?? 'C');
-  const scaleVal = String(currentScene.parameters?.HarmonyScale ?? 'Major');
+  // Canonical resolution of musical attributes through the inheritance chain
+  const musicalAttrs = resolveSongMusicalAttributes(currentScene, basePreset);
 
   const handleSelectSong = (scene: Scene) => {
     dispatch({
@@ -123,11 +128,21 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
     });
   };
 
+  const handleMetadataChange = (key: 'artist' | 'notes' | 'tags', value: string) => {
+    dispatch({
+      type: 'UPDATE_SCENE_METADATA',
+      sceneId: currentScene.id,
+      metadata: {
+        ...(currentScene.metadata || {}),
+        [key]: value,
+      },
+    });
+  };
+
   return (
     <div className="flex-1 flex flex-col md:flex-row overflow-hidden bg-[#090A0E]">
-      {/* Songs Sidebar (Compact on desktop) */}
+      {/* Songs Sidebar */}
       <aside className="w-full md:w-60 bg-[#101116] border-b md:border-b-0 md:border-r border-[#292A30] flex flex-col shrink-0">
-        {/* Songs Header */}
         <div className="p-3 border-b border-[#292A30] flex items-center justify-between">
           <div className="flex items-center gap-1.5">
             <Music className="w-4 h-4 text-[#20D6C7]" />
@@ -174,7 +189,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                   </div>
                 </div>
 
-                {/* Song actions menu (...) */}
+                {/* Touch friendly Song actions menu (...) */}
                 <div className="relative shrink-0 ml-1">
                   <button
                     type="button"
@@ -182,7 +197,8 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                       e.stopPropagation();
                       setActiveSongMenu(activeSongMenu === scene.id ? null : scene.id);
                     }}
-                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-0 group-hover:opacity-100 transition"
+                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
+                    title="Song options"
                   >
                     <MoreVertical className="w-3.5 h-3.5" />
                   </button>
@@ -198,7 +214,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                           dispatch({ type: 'DUPLICATE_SCENE', sceneId: scene.id });
                           setActiveSongMenu(null);
                         }}
-                        className="w-full text-left px-3 py-1.5 text-xs text-[#F0EDE5] hover:bg-[#1C1D24] flex items-center gap-2"
+                        className="w-full text-left px-3 py-1.5 text-xs text-[#F0EDE5] hover:bg-[#1C1D24] flex items-center gap-2 cursor-pointer"
                       >
                         <Copy className="w-3.5 h-3.5 text-[#B1ACA3]" />
                         <span>Duplicate</span>
@@ -210,7 +226,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                             dispatch({ type: 'DELETE_SCENE', sceneId: scene.id });
                             setActiveSongMenu(null);
                           }}
-                          className="w-full text-left px-3 py-1.5 text-xs text-[#E65050] hover:bg-[#1C1D24] flex items-center gap-2"
+                          className="w-full text-left px-3 py-1.5 text-xs text-[#E65050] hover:bg-[#1C1D24] flex items-center gap-2 cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                           <span>Delete</span>
@@ -226,11 +242,11 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
       </aside>
 
       {/* Main Song Canvas */}
-      <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6">
+      <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-5">
         {/* Song Header & Musical Controls */}
-        <div className="bg-[#14151B] border border-[#292A30] rounded-[5px] p-4 md:p-5 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#292A30] pb-4">
-            <div className="flex-1 min-w-0">
+        <div className="bg-[#14151B] border border-[#292A30] rounded-[5px] p-4 md:p-5 space-y-3.5">
+          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 border-b border-[#292A30] pb-3.5">
+            <div className="flex-1 min-w-0 space-y-1">
               <input
                 type="text"
                 value={currentScene.name}
@@ -243,13 +259,65 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                 placeholder="Song Title"
                 className="text-xl md:text-2xl font-bold bg-transparent text-[#F0EDE5] border-b border-transparent hover:border-[#34343C] focus:border-[#F45126] focus:outline-none transition py-0.5 w-full"
               />
-              <div className="text-[11px] text-[#716E69] font-mono mt-0.5">
-                Song Configuration
+
+              {/* Restored Artist Input */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={currentScene.metadata?.artist || ''}
+                  onChange={(e) => handleMetadataChange('artist', e.target.value)}
+                  placeholder="Artist (optional)"
+                  className="bg-transparent text-xs text-[#B1ACA3] placeholder-[#4A4947] border-b border-transparent hover:border-[#34343C] focus:border-[#20D6C7] focus:outline-none transition py-0.5 w-48 sm:w-64"
+                />
+
+                {/* Toggle for Tags and Notes */}
+                <button
+                  type="button"
+                  onClick={() => setShowMetadataDetails(!showMetadataDetails)}
+                  className="text-[11px] text-[#716E69] hover:text-[#B1ACA3] flex items-center gap-0.5 ml-2 cursor-pointer select-none"
+                >
+                  <span>Details</span>
+                  {showMetadataDetails ? (
+                    <ChevronUp className="w-3 h-3" />
+                  ) : (
+                    <ChevronDown className="w-3 h-3" />
+                  )}
+                </button>
               </div>
+
+              {/* Collapsible Details: Tags & Notes */}
+              {showMetadataDetails && (
+                <div className="pt-2 grid grid-cols-1 sm:grid-cols-2 gap-3 bg-[#101116] p-3 rounded-[4px] border border-[#292A30] mt-2">
+                  <div>
+                    <label className="text-[10px] font-mono text-[#716E69] block mb-1">
+                      Tags (comma separated)
+                    </label>
+                    <input
+                      type="text"
+                      value={currentScene.metadata?.tags || ''}
+                      onChange={(e) => handleMetadataChange('tags', e.target.value)}
+                      placeholder="e.g. acoustic, ballad, live"
+                      className="w-full bg-[#14151B] border border-[#34343C] rounded-[3px] px-2 py-1 text-xs text-[#F0EDE5] focus:border-[#20D6C7] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-[#716E69] block mb-1">
+                      Performance Notes
+                    </label>
+                    <input
+                      type="text"
+                      value={currentScene.metadata?.notes || ''}
+                      onChange={(e) => handleMetadataChange('notes', e.target.value)}
+                      placeholder="e.g. Acoustic guitar intro"
+                      className="w-full bg-[#14151B] border border-[#34343C] rounded-[3px] px-2 py-1 text-xs text-[#F0EDE5] focus:border-[#20D6C7] focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Sound (Base Preset) Selector */}
-            <div className="flex items-center gap-2 bg-[#101116] border border-[#292A30] px-3 py-1.5 rounded-[4px] shrink-0">
+            <div className="flex items-center gap-2 bg-[#101116] border border-[#292A30] px-3 py-1.5 rounded-[4px] shrink-0 self-start">
               <Sliders className="w-4 h-4 text-[#F45126]" />
               <div className="text-xs">
                 <span className="text-[#716E69] mr-1.5">Sound:</span>
@@ -279,24 +347,46 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
             </div>
           </div>
 
-          {/* Musical Parameters: Tempo, Key, Scale */}
+          {/* Musical Parameters: Tempo, Key, Scale (Catalog-driven ranges and canonical resolution) */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {/* Tempo BPM */}
             <div className="bg-[#101116] border border-[#292A30] rounded-[4px] p-2.5 flex items-center justify-between">
               <div>
-                <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
-                  Tempo
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
+                    Tempo
+                  </span>
+                  {musicalAttrs.isTempoOverridden && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        dispatch({
+                          type: 'DELETE_SCENE_PARAMETER',
+                          sceneId: currentScene.id,
+                          paramName: 'TempoBpm',
+                        })
+                      }
+                      className="text-[9px] font-mono text-[#B1ACA3] hover:text-[#F45126] flex items-center gap-0.5 cursor-pointer"
+                      title="Reset to inherited sound/default tempo"
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Reset</span>
+                    </button>
+                  )}
+                </div>
                 <div className="text-sm font-mono font-bold text-[#20D6C7]">
-                  {tempoVal} <span className="text-[10px] text-[#716E69]">BPM</span>
+                  {musicalAttrs.tempo}{' '}
+                  <span className="text-[10px] text-[#716E69]">
+                    {tempoDesc?.unit || 'BPM'}
+                  </span>
                 </div>
               </div>
               <input
                 type="number"
-                min={30}
-                max={300}
-                step={0.5}
-                value={tempoVal}
+                min={tempoDesc?.min ?? 30}
+                max={tempoDesc?.max ?? 300}
+                step={tempoDesc?.step ?? 0.1}
+                value={musicalAttrs.tempo}
                 onChange={(e) =>
                   dispatch({
                     type: 'SET_SCENE_PARAMETER',
@@ -312,15 +402,34 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
             {/* Key */}
             <div className="bg-[#101116] border border-[#292A30] rounded-[4px] p-2.5 flex items-center justify-between">
               <div>
-                <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
-                  Key
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
+                    Key
+                  </span>
+                  {musicalAttrs.isKeyOverridden && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        dispatch({
+                          type: 'DELETE_SCENE_PARAMETER',
+                          sceneId: currentScene.id,
+                          paramName: 'HarmonyKey',
+                        })
+                      }
+                      className="text-[9px] font-mono text-[#B1ACA3] hover:text-[#F45126] flex items-center gap-0.5 cursor-pointer"
+                      title="Reset to inherited key"
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Reset</span>
+                    </button>
+                  )}
+                </div>
                 <div className="text-sm font-mono font-bold text-[#20D6C7]">
-                  {keyVal}
+                  {musicalAttrs.key}
                 </div>
               </div>
               <select
-                value={keyVal}
+                value={musicalAttrs.key}
                 onChange={(e) =>
                   dispatch({
                     type: 'SET_SCENE_PARAMETER',
@@ -331,7 +440,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                 }
                 className="bg-[#14151B] border border-[#34343C] rounded-[3px] px-2 py-1 text-xs text-[#F0EDE5] font-mono focus:border-[#20D6C7] focus:outline-none cursor-pointer"
               >
-                {catalog.getEnumValues('HarmonyKey')?.map((k) => (
+                {keyDesc?.values?.map((k) => (
                   <option key={k} value={k} className="bg-[#14151B]">
                     {k}
                   </option>
@@ -342,15 +451,34 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
             {/* Scale */}
             <div className="bg-[#101116] border border-[#292A30] rounded-[4px] p-2.5 flex items-center justify-between">
               <div>
-                <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
-                  Scale
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-mono text-[#716E69] uppercase tracking-wider block">
+                    Scale
+                  </span>
+                  {musicalAttrs.isScaleOverridden && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        dispatch({
+                          type: 'DELETE_SCENE_PARAMETER',
+                          sceneId: currentScene.id,
+                          paramName: 'HarmonyScale',
+                        })
+                      }
+                      className="text-[9px] font-mono text-[#B1ACA3] hover:text-[#F45126] flex items-center gap-0.5 cursor-pointer"
+                      title="Reset to inherited scale"
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Reset</span>
+                    </button>
+                  )}
+                </div>
                 <div className="text-sm font-mono font-bold text-[#20D6C7]">
-                  {scaleVal}
+                  {musicalAttrs.scale}
                 </div>
               </div>
               <select
-                value={scaleVal}
+                value={musicalAttrs.scale}
                 onChange={(e) =>
                   dispatch({
                     type: 'SET_SCENE_PARAMETER',
@@ -361,7 +489,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                 }
                 className="bg-[#14151B] border border-[#34343C] rounded-[3px] px-2 py-1 text-xs text-[#F0EDE5] font-mono focus:border-[#20D6C7] focus:outline-none cursor-pointer"
               >
-                {catalog.getEnumValues('HarmonyScale')?.map((s) => (
+                {scaleDesc?.values?.map((s) => (
                   <option key={s} value={s} className="bg-[#14151B]">
                     {s}
                   </option>
@@ -374,15 +502,32 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
         {/* Section Strip: Horizontal song arrangement strip */}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="font-bold tracking-wider text-[#F0EDE5]">
-                SONG SECTIONS
+                SECTIONS
               </span>
-              <span className="text-[#716E69] text-[11px]">
-                {currentSubscene
-                  ? `Editing: ${currentSubscene.name}`
-                  : 'Editing: Entire Song (Base)'}
-              </span>
+              {currentSubscene ? (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[#716E69] text-[11px]">Editing:</span>
+                  <input
+                    type="text"
+                    value={currentSubscene.name}
+                    onChange={(e) =>
+                      dispatch({
+                        type: 'UPDATE_SUBSCENE',
+                        sceneId: currentScene.id,
+                        subscene: { ...currentSubscene, name: e.target.value },
+                      })
+                    }
+                    className="bg-[#14151B] border border-[#34343C] focus:border-[#F45126] rounded-[3px] px-2 py-0.5 text-xs text-[#F0EDE5] font-semibold focus:outline-none"
+                    title="Click to rename section"
+                  />
+                </div>
+              ) : (
+                <span className="text-[#716E69] text-[11px]">
+                  Editing: Entire Song (Default)
+                </span>
+              )}
             </div>
 
             {/* Quick Add buttons */}
@@ -449,7 +594,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                         type="button"
                         disabled={idx === 0}
                         onClick={() => handleMoveSection(idx, 'left')}
-                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] disabled:opacity-20 rounded"
+                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] disabled:opacity-20 rounded cursor-pointer"
                         title="Move left"
                       >
                         <ChevronLeft className="w-3 h-3" />
@@ -458,7 +603,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                         type="button"
                         disabled={idx === currentScene.subscenes.length - 1}
                         onClick={() => handleMoveSection(idx, 'right')}
-                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] disabled:opacity-20 rounded"
+                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] disabled:opacity-20 rounded cursor-pointer"
                         title="Move right"
                       >
                         <ChevronRight className="w-3 h-3" />
@@ -472,7 +617,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                             subsceneId: sub.id,
                           })
                         }
-                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] rounded"
+                        className="p-1 text-[#B1ACA3] hover:text-[#F0EDE5] rounded cursor-pointer"
                         title="Duplicate section"
                       >
                         <Copy className="w-3 h-3" />
@@ -487,7 +632,7 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                               subsceneId: sub.id,
                             })
                           }
-                          className="p-1 text-[#E65050] hover:text-[#FF6030] rounded"
+                          className="p-1 text-[#E65050] hover:text-[#FF6030] rounded cursor-pointer"
                           title="Delete section"
                         >
                           <Trash2 className="w-3 h-3" />
@@ -499,10 +644,10 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
               );
             })}
 
-            {/* Quick Add Custom Section */}
+            {/* Add Section Button (Creates "New Section" instead of hardcoded "Bridge") */}
             <button
               type="button"
-              onClick={() => handleAddSection('Bridge')}
+              onClick={() => handleAddSection('New Section')}
               className="px-2.5 py-2 rounded-[4px] text-xs font-mono bg-[#101116] hover:bg-[#14151B] text-[#716E69] hover:text-[#F0EDE5] border border-dashed border-[#292A30] transition shrink-0 cursor-pointer flex items-center gap-1"
             >
               <Plus className="w-3.5 h-3.5" />

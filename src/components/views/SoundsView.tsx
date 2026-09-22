@@ -3,6 +3,7 @@ import { useEditor } from '../../state/editorState';
 import { Preset } from '../../domain/models';
 import { FxRack } from '../rack/FxRack';
 import { EFFECT_MODULES } from '../../domain/effectModules';
+import { resolveParameterState } from '../../domain/resolution';
 import { Sliders, Plus, Copy, Trash2, MoreVertical } from 'lucide-react';
 
 interface SoundsViewProps {
@@ -79,10 +80,16 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
             const isSelected = preset.id === currentPreset.id;
             const paramCount = Object.keys(preset.parameters || {}).length;
 
-            // Find active effects in preset
+            // Find resolved active effects in preset through canonical resolution:
+            // Firmware Default -> Preset
             const activeFx = EFFECT_MODULES.filter((m) => {
               if (!m.enableParam) return false;
-              return Boolean(preset.parameters?.[m.enableParam]);
+              const res = resolveParameterState({
+                name: m.enableParam,
+                preset,
+                currentLevel: 'preset',
+              });
+              return Boolean(res.resolvedValue);
             }).map((m) => m.name);
 
             return (
@@ -109,7 +116,7 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                   </div>
                 </div>
 
-                {/* Overflow menu (...) */}
+                {/* Touch-friendly overflow menu (...) */}
                 <div className="relative shrink-0 ml-1">
                   <button
                     type="button"
@@ -117,7 +124,8 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                       e.stopPropagation();
                       setActiveMenuId(activeMenuId === preset.id ? null : preset.id);
                     }}
-                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-0 group-hover:opacity-100 transition"
+                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
+                    title="Sound options"
                   >
                     <MoreVertical className="w-3.5 h-3.5" />
                   </button>
@@ -133,7 +141,7 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                           dispatch({ type: 'DUPLICATE_PRESET', presetId: preset.id });
                           setActiveMenuId(null);
                         }}
-                        className="w-full text-left px-3 py-1.5 text-xs text-[#F0EDE5] hover:bg-[#1C1D24] flex items-center gap-2"
+                        className="w-full text-left px-3 py-1.5 text-xs text-[#F0EDE5] hover:bg-[#1C1D24] flex items-center gap-2 cursor-pointer"
                       >
                         <Copy className="w-3.5 h-3.5 text-[#B1ACA3]" />
                         <span>Duplicate</span>
@@ -145,7 +153,7 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                             dispatch({ type: 'DELETE_PRESET', presetId: preset.id });
                             setActiveMenuId(null);
                           }}
-                          className="w-full text-left px-3 py-1.5 text-xs text-[#E65050] hover:bg-[#1C1D24] flex items-center gap-2"
+                          className="w-full text-left px-3 py-1.5 text-xs text-[#E65050] hover:bg-[#1C1D24] flex items-center gap-2 cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                           <span>Delete</span>

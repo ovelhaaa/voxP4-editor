@@ -112,39 +112,34 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
         </div>
       </div>
 
-      {/* Center Validation Badge (Discreet) */}
+      {/* Center Validation Badge: Silence is success. Only visible when there are errors or warnings */}
       <div className="hidden md:flex items-center">
-        <button
-          type="button"
-          onClick={onOpenValidation}
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-[3px] text-xs font-mono tracking-wide border transition cursor-pointer ${
-            errorCount > 0
-              ? 'bg-[#E65050]/20 text-[#E65050] border-[#E65050]/50 hover:bg-[#E65050]/30'
-              : warningCount > 0
-                ? 'bg-[#E6A63A]/10 text-[#E6A63A] border-[#E6A63A]/40 hover:bg-[#E6A63A]/20'
-                : 'bg-[#14151B] text-[#20D6C7] border-[#292A30] hover:border-[#20D6C7]/50'
-          }`}
-          title="Validation Status"
-        >
-          {errorCount > 0 ? (
-            <>
-              <XCircle className="w-3.5 h-3.5 text-[#E65050]" />
-              <span>
-                {errorCount} {errorCount === 1 ? 'ERROR' : 'ERRORS'}
-              </span>
-            </>
-          ) : warningCount > 0 ? (
-            <>
-              <AlertTriangle className="w-3.5 h-3.5 text-[#E6A63A]" />
-              <span>{warningCount} WARNINGS</span>
-            </>
-          ) : (
-            <>
-              <CheckCircle2 className="w-3.5 h-3.5 text-[#20D6C7]" />
-              <span>VALID</span>
-            </>
-          )}
-        </button>
+        {(errorCount > 0 || warningCount > 0) && (
+          <button
+            type="button"
+            onClick={onOpenValidation}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-[3px] text-xs font-mono tracking-wide border transition cursor-pointer ${
+              errorCount > 0
+                ? 'bg-[#E65050]/20 text-[#E65050] border-[#E65050]/50 hover:bg-[#E65050]/30'
+                : 'bg-[#E6A63A]/10 text-[#E6A63A] border-[#E6A63A]/40 hover:bg-[#E6A63A]/20'
+            }`}
+            title="Validation Details"
+          >
+            {errorCount > 0 ? (
+              <>
+                <XCircle className="w-3.5 h-3.5 text-[#E65050]" />
+                <span>
+                  {errorCount} {errorCount === 1 ? 'ERROR' : 'ERRORS'}
+                </span>
+              </>
+            ) : (
+              <>
+                <AlertTriangle className="w-3.5 h-3.5 text-[#E6A63A]" />
+                <span>{warningCount} WARNINGS</span>
+              </>
+            )}
+          </button>
+        )}
       </div>
 
       {/* Right Actions */}
@@ -233,19 +228,6 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
                 <span>Import (.voxp4.json)</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  exportLibrary();
-                  setIsMenuOpen(false);
-                }}
-                disabled={errorCount > 0}
-                className="w-full text-left px-3 py-2 text-[#F0EDE5] hover:bg-[#1C1D24] flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-              >
-                <Download className="w-4 h-4 text-[#FF6030]" />
-                <span>Export (.voxp4.json)</span>
-              </button>
-
               <div className="h-px bg-[#292A30] my-1" />
 
               <button
@@ -272,7 +254,7 @@ export const ProjectHeader: React.FC<ProjectHeaderProps> = ({
           className="hidden"
         />
 
-        {/* Primary Export Button */}
+        {/* Primary Export Button (Single, non-duplicated export action) */}
         <button
           type="button"
           onClick={exportLibrary}
