@@ -1,0 +1,150 @@
+{
+  "format": "voxp4-library",
+  "formatVersion": 1,
+  "schemaVersion": 1,
+  "libraryId": "arena-world-tour",
+  "name": "Arena World Tour 2026",
+  "presets": [
+    {
+      "id": "preset-studio-dry",
+      "name": "Studio Dry Vocal",
+      "parameters": {
+        "CompressorEnable": true,
+        "CompressorRatio": 4,
+        "CompressorThresholdDb": -20,
+        "DelayEnable": false,
+        "GateEnable": true,
+        "GateThresholdDb": -50,
+        "HarmonyEnable": false,
+        "ReverbEnable": true,
+        "ReverbWet": 0.1
+      }
+    },
+    {
+      "id": "preset-stadium-shimmer",
+      "name": "Stadium Shimmer",
+      "parameters": {
+        "ChorusMix": 0.25,
+        "ChorusMode": "Chorus",
+        "DelayEnable": true,
+        "DelayFeedback": 0.35,
+        "DelayWet": 0.2,
+        "HarmonyEnable": true,
+        "HarmonyLevel": 0.75,
+        "HarmonyVoice1Pan": 0.25,
+        "ReverbDecayS": 3.5,
+        "ReverbEnable": true,
+        "ReverbWet": 0.35
+      }
+    }
+  ],
+  "scenes": [
+    {
+      "id": "scene-hallelujah",
+      "name": "Hallelujah",
+      "basePresetId": "preset-studio-dry",
+      "metadata": {
+        "artist": "Leonard Cohen",
+        "notes": "12/8 ballad in C"
+      },
+      "parameters": {
+        "HarmonyKey": "C",
+        "HarmonyScale": "Major",
+        "TempoBpm": 54
+      },
+      "subscenes": [
+        {
+          "id": "hal-verse-1",
+          "name": "Verse 1",
+          "parameters": {
+            "HarmonyEnable": false,
+            "ReverbWet": 0.12
+          }
+        },
+        {
+          "id": "hal-chorus-1",
+          "name": "Chorus 1",
+          "parameters": {
+            "HarmonyEnable": true,
+            "HarmonyInterval": 4,
+            "ReverbWet": 0.25
+          }
+        },
+        {
+          "id": "hal-verse-2",
+          "name": "Verse 2",
+          "parameters": {
+            "HarmonyEnable": false,
+            "ReverbWet": 0.14
+          }
+        },
+        {
+          "id": "hal-climax-chorus",
+          "name": "Climax Chorus",
+          "parameters": {
+            "DelayEnable": true,
+            "DelayWet": 0.28,
+            "HarmonyEnable": true,
+            "HarmonyInterval": 7,
+            "HarmonyLevel": 0.95,
+            "ReverbWet": 0.4
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-sound-of-silence",
+      "name": "Sound of Silence",
+      "basePresetId": "preset-stadium-shimmer",
+      "metadata": {
+        "artist": "Disturbed Style",
+        "notes": "Starts whispered, ends towering"
+      },
+      "parameters": {
+        "HarmonyKey": "D#",
+        "HarmonyScale": "NaturalMinor",
+        "TempoBpm": 86
+      },
+      "subscenes": [
+        {
+          "id": "silence-intro",
+          "name": "Whisper Intro",
+          "parameters": {
+            "DelayEnable": false,
+            "HarmonyEnable": false,
+            "ReverbWet": 0.22
+          }
+        },
+        {
+          "id": "silence-epic-end",
+          "name": "Epic Outro",
+          "parameters": {
+            "DelayEnable": true,
+            "DelayWet": 0.35,
+            "DriveEnable": true,
+            "DriveMix": 0.3,
+            "HarmonyEnable": true,
+            "HarmonyLevel": 1,
+            "ReverbWet": 0.45
+          }
+        }
+      ]
+    }
+  ],
+  "setlists": [
+    {
+      "id": "setlist-encore",
+      "name": "Encore Set",
+      "entries": [
+        {
+          "id": "enc-1",
+          "sceneId": "scene-hallelujah"
+        },
+        {
+          "id": "enc-2",
+          "sceneId": "scene-sound-of-silence"
+        }
+      ]
+    }
+  ]
+}
