@@ -13,6 +13,7 @@ import {
   Sparkles,
   Minimize2,
   Maximize2,
+  Clock,
 } from 'lucide-react';
 import { useEditor } from '../../state/editorState';
 import { previewEngine } from '../../audio/PreviewEngine';
@@ -31,6 +32,7 @@ export const VocalPreviewPanel: React.FC = () => {
   const { selection, library } = state;
 
   const [status, setStatus] = useState<PreviewEngineStatus>(previewEngine.getStatus());
+  const [currentTime, setCurrentTime] = useState<number>(previewEngine.getCurrentTime());
   const [referenceSamples, setReferenceSamples] = useState<readonly ReferenceSample[]>(
     getDefaultReferenceSamples()
   );
@@ -40,10 +42,18 @@ export const VocalPreviewPanel: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Subscribe to engine status updates
+  // Subscribe to low-frequency state transitions
   useEffect(() => {
     const unsubscribe = previewEngine.subscribe((newStatus) => {
       setStatus(newStatus);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Subscribe to high-frequency transport clock updates (50ms)
+  useEffect(() => {
+    const unsubscribe = previewEngine.subscribeClock((time) => {
+      setCurrentTime(time);
     });
     return () => unsubscribe();
   }, []);
@@ -84,6 +94,8 @@ export const VocalPreviewPanel: React.FC = () => {
       const preset = library.presets.find((p) => p.id === selection.id) || library.presets[0];
       if (preset) {
         return {
+          id: `preset:${preset.id}`,
+          type: 'preset' as const,
           label: `Preset: ${preset.name}`,
           params: resolveAllParameters({ preset, currentLevel: 'preset' }),
         };
@@ -93,6 +105,8 @@ export const VocalPreviewPanel: React.FC = () => {
       if (scene) {
         const basePreset = library.presets.find((p) => p.id === scene.basePresetId);
         return {
+          id: `scene:${scene.id}`,
+          type: 'scene' as const,
           label: `Song: ${scene.name}`,
           params: resolveAllParameters({ preset: basePreset, scene, currentLevel: 'scene' }),
         };
@@ -103,6 +117,8 @@ export const VocalPreviewPanel: React.FC = () => {
       if (scene && subscene) {
         const basePreset = library.presets.find((p) => p.id === scene.basePresetId);
         return {
+          id: `subscene:${scene.id}/${subscene.id}`,
+          type: 'subscene' as const,
           label: `Section: ${scene.name} > ${subscene.name}`,
           params: resolveAllParameters({
             preset: basePreset,
@@ -118,6 +134,8 @@ export const VocalPreviewPanel: React.FC = () => {
     const fallbackPreset = library.presets[0];
     if (fallbackPreset) {
       return {
+        id: `preset:${fallbackPreset.id}`,
+        type: 'preset' as const,
         label: `Preset: ${fallbackPreset.name}`,
         params: resolveAllParameters({ preset: fallbackPreset, currentLevel: 'preset' }),
       };
@@ -135,18 +153,34 @@ export const VocalPreviewPanel: React.FC = () => {
       return;
     }
 
-    // If already rendered for this context, just play
-    if (status.state === 'rendered' || status.state === 'paused') {
+    // Dry playback can start immediately regardless of DSP fingerprint
+    if (status.auditionMode === 'dry') {
+      previewEngine.play();
+      return;
+    }
+
+    // For Processed mode: check if current render is available and not stale
+    const isReady =
+      (status.state === 'rendered' || status.state === 'paused') &&
+      !status.isPreviewStale &&
+      status.activeContextId === ctx.id;
+
+    if (isReady) {
       previewEngine.play();
       return;
     }
 
     // Trigger render then play
     try {
-      await previewEngine.requestRender(ctx.label, ctx.params);
+      await previewEngine.requestRender(
+        { id: ctx.id, type: ctx.type, label: ctx.label },
+        ctx.params
+      );
       previewEngine.play();
-    } catch (err) {
-      console.error('Render preview failed:', err);
+    } catch (err: any) {
+      if (err.name !== 'RenderSupersededError' && err.name !== 'RenderCancelledError') {
+        console.error('Render preview failed:', err);
+      }
     }
   };
 
@@ -154,9 +188,14 @@ export const VocalPreviewPanel: React.FC = () => {
     const ctx = getActiveContext();
     if (!ctx) return;
     try {
-      await previewEngine.requestRender(ctx.label, ctx.params);
-    } catch (err) {
-      console.error('Render preview failed:', err);
+      await previewEngine.requestRender(
+        { id: ctx.id, type: ctx.type, label: ctx.label },
+        ctx.params
+      );
+    } catch (err: any) {
+      if (err.name !== 'RenderSupersededError' && err.name !== 'RenderCancelledError') {
+        console.error('Render preview failed:', err);
+      }
     }
   };
 
@@ -185,7 +224,7 @@ export const VocalPreviewPanel: React.FC = () => {
 
   const activeCtx = getActiveContext();
   const currentDuration = status.duration || 1;
-  const currentProgress = Math.min(status.currentTime / currentDuration, 1.0);
+  const currentProgress = Math.min(currentTime / currentDuration, 1.0);
 
   return (
     <div className="bg-[#101116] border-t border-[#292A30] shadow-2xl transition-all z-20 flex flex-col select-none">
@@ -339,10 +378,21 @@ export const VocalPreviewPanel: React.FC = () => {
                   <AlertCircle className="w-3 h-3" />
                   <span>DSP Error</span>
                 </div>
+              ) : status.isPreviewStale ? (
+                <div
+                  className="flex items-center gap-1.5 text-[10px] text-[#F5A623] font-mono px-2 py-0.5 rounded bg-[#F5A623]/10 border border-[#F5A623]/30"
+                  title="Parameters modified since last render"
+                >
+                  <Clock className="w-3 h-3" />
+                  <span>Render Stale</span>
+                </div>
               ) : status.lastRenderTimeMs !== null ? (
                 <div className="flex items-center gap-1.5 text-[10px] text-[#20D6C7] font-mono px-2 py-0.5 rounded bg-[#20D6C7]/10 border border-[#20D6C7]/30">
                   <Sparkles className="w-3 h-3" />
-                  <span>Rendered ({Math.round(status.lastRenderTimeMs)}ms)</span>
+                  <span>
+                    Rendered ({Math.round(status.lastRenderTimeMs)}ms
+                    {status.tailDurationSeconds > 0 && ` + ${status.tailDurationSeconds.toFixed(1)}s tail`})
+                  </span>
                 </div>
               ) : (
                 <div className="text-[10px] text-[#716E69] font-mono">Ready to render</div>
@@ -441,7 +491,7 @@ export const VocalPreviewPanel: React.FC = () => {
             {/* Scrub / Progress Bar */}
             <div className="flex-1 w-full flex items-center gap-3">
               <span className="text-[10px] font-mono text-[#716E69] w-12 text-right">
-                {formatTime(status.currentTime)}
+                {formatTime(currentTime)}
               </span>
 
               <div className="relative flex-1 flex items-center">
@@ -451,7 +501,7 @@ export const VocalPreviewPanel: React.FC = () => {
                   min={0}
                   max={currentDuration}
                   step={0.01}
-                  value={status.currentTime}
+                  value={currentTime}
                   onChange={handleScrub}
                   disabled={!status.activeSource}
                   className="w-full h-1.5 bg-[#1C1D24] rounded-lg appearance-none cursor-pointer accent-[#F45126] focus:outline-none"

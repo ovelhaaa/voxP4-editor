@@ -1,7 +1,9 @@
 {
   "engine": "voxP4",
   "dspCommit": "e25136226b76e2a349de0ae8b2bc518cf9477c8b",
+  "wasmSha256": "619dd64eba298bcff322ef89e15a9fbccdc895e41dc6e7562367addc5f2ba62a",
   "contractVersion": 1,
+  "contractSha256": "fbbf398fbf345356ea790cbb5a133d15740616cf13f1fcc5d7cbcafd6b077623",
   "parameterCount": 71,
   "sampleRate": 48000,
   "blockSize": 64,

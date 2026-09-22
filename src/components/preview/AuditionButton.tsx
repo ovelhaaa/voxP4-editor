@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { Play, Pause, Loader2 } from 'lucide-react';
 import { previewEngine } from '../../audio/PreviewEngine';
-import { PreviewEngineStatus } from '../../audio/types';
+import { ContextType, PreviewEngineStatus } from '../../audio/types';
 import { ResolvedParameterState } from '../../domain/resolution';
 
 interface AuditionButtonProps {
+  contextId?: string;
+  contextType?: ContextType;
   label: string;
   resolvedParams: () => readonly ResolvedParameterState[];
   className?: string;
@@ -12,6 +14,8 @@ interface AuditionButtonProps {
 }
 
 export const AuditionButton: React.FC<AuditionButtonProps> = ({
+  contextId,
+  contextType,
   label,
   resolvedParams,
   className = '',
@@ -19,11 +23,15 @@ export const AuditionButton: React.FC<AuditionButtonProps> = ({
 }) => {
   const [status, setStatus] = useState<PreviewEngineStatus>(previewEngine.getStatus());
 
+  // AuditionButton only subscribes to state transitions, NOT high frequency clock updates
   useEffect(() => {
     return previewEngine.subscribe(setStatus);
   }, []);
 
-  const isCurrentAudition = status.activeContextLabel === label;
+  const isCurrentAudition = contextId
+    ? status.activeContextId === contextId
+    : status.activeContextLabel === label;
+
   const isPlayingThis = isCurrentAudition && status.state === 'playing';
   const isRenderingThis = isCurrentAudition && status.state === 'rendering';
 
@@ -35,12 +43,24 @@ export const AuditionButton: React.FC<AuditionButtonProps> = ({
       return;
     }
 
+    // If already rendered for this exact configuration and not stale, start playback immediately
+    if (
+      isCurrentAudition &&
+      (status.state === 'rendered' || status.state === 'paused') &&
+      !status.isPreviewStale
+    ) {
+      previewEngine.play();
+      return;
+    }
+
     try {
       const params = resolvedParams();
-      await previewEngine.requestRender(label, params);
+      await previewEngine.requestRender({ id: contextId, type: contextType, label }, params);
       previewEngine.play();
-    } catch (err) {
-      console.error('Audition failed:', err);
+    } catch (err: any) {
+      if (err.name !== 'RenderSupersededError' && err.name !== 'RenderCancelledError') {
+        console.error('Audition failed:', err);
+      }
     }
   };
 

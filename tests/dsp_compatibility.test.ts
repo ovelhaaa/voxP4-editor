@@ -10,6 +10,10 @@ describe('DSP Compatibility & Contract Parity', () => {
     expect(compatibilityManifest.sampleRate).toBe(48000);
     expect(compatibilityManifest.blockSize).toBe(64);
     expect(compatibilityManifest.parameterCount).toBe(71);
+    expect(compatibilityManifest.wasmSha256).toBeDefined();
+    expect(compatibilityManifest.wasmSha256.length).toBe(64);
+    expect(compatibilityManifest.contractSha256).toBeDefined();
+    expect(compatibilityManifest.contractSha256.length).toBe(64);
   });
 
   it('parameter catalog loads all 71 parameters matching contracts/voxp4-parameters-v1.json exactly', () => {

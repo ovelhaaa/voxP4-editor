@@ -194,6 +194,8 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                 {/* Audition button and touch friendly Song actions menu */}
                 <div className="flex items-center gap-0.5 shrink-0 ml-1">
                   <AuditionButton
+                    contextId={`scene:${scene.id}`}
+                    contextType="scene"
                     label={`Song: ${scene.name}`}
                     resolvedParams={() =>
                       resolveAllParameters({ preset: scenePreset, scene, currentLevel: 'scene' })
@@ -359,6 +361,8 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
               </div>
 
               <AuditionButton
+                contextId={`scene:${currentScene.id}`}
+                contextType="scene"
                 label={`Song: ${currentScene.name}`}
                 resolvedParams={() =>
                   resolveAllParameters({ preset: basePreset, scene: currentScene, currentLevel: 'scene' })

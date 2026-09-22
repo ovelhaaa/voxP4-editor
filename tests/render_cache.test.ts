@@ -89,17 +89,23 @@ describe('Render Cache & Deterministic Hash Key', () => {
     expect(baseKey).not.toBe(diffParams);
   });
 
-  it('enforces LRU eviction capacity', () => {
-    const cache = new RenderCache(3);
+  it('enforces memory-bounded LRU eviction capacity and tracks byteSize', () => {
+    // Budget enough for exactly 3 mock entries (~680 bytes each)
     const mockAudio = (id: string, key: string): RenderedAudio => ({
       sourceId: id,
       cacheKey: key,
+      fingerprint: key,
       duration: 1.0,
+      tailDurationSeconds: 0,
       sampleRate: 48000,
       left: new Float32Array(48),
       right: new Float32Array(48),
       renderTimeMs: 10,
     });
+
+    const singleSize = (48 + 48) * 4 + 256 + 2 * (2 + 2 + 2); // ~646 bytes
+    const budgetFor3 = singleSize * 3 + 100;
+    const cache = new RenderCache(budgetFor3);
 
     cache.set('k1', mockAudio('s1', 'k1'));
     cache.set('k2', mockAudio('s2', 'k2'));
@@ -109,11 +115,13 @@ describe('Render Cache & Deterministic Hash Key', () => {
     expect(cache.has('k2')).toBe(true);
     expect(cache.has('k3')).toBe(true);
     expect(cache.size).toBe(3);
+    expect(cache.byteSize).toBeGreaterThan(0);
+    expect(cache.byteSize).toBeLessThanOrEqual(budgetFor3);
 
     // Access k1 to make it most recently used
     cache.get('k1');
 
-    // Add k4 -> should evict k2 (oldest)
+    // Add k4 -> should evict k2 (oldest) because buffer only holds 3
     cache.set('k4', mockAudio('s4', 'k4'));
 
     expect(cache.has('k2')).toBe(false);
@@ -121,5 +129,6 @@ describe('Render Cache & Deterministic Hash Key', () => {
     expect(cache.has('k3')).toBe(true);
     expect(cache.has('k4')).toBe(true);
     expect(cache.size).toBe(3);
+    expect(cache.byteSize).toBeLessThanOrEqual(budgetFor3);
   });
 });

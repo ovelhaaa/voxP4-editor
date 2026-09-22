@@ -130,6 +130,5 @@ export async function loadReferenceAudioSource(
     duration: decoded.duration,
     sampleRate: decoded.sampleRate,
     samples: decoded.samples,
-    rawBuffer: decoded.originalBuffer,
   };
 }

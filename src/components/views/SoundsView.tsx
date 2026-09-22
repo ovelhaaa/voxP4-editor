@@ -120,6 +120,8 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                 {/* Audition button and overflow menu */}
                 <div className="flex items-center gap-0.5 shrink-0 ml-1">
                   <AuditionButton
+                    contextId={`preset:${preset.id}`}
+                    contextType="preset"
                     label={`Preset: ${preset.name}`}
                     resolvedParams={() => resolveAllParameters({ preset, currentLevel: 'preset' })}
                   />
@@ -200,6 +202,8 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
 
           <div className="flex items-center gap-2">
             <AuditionButton
+              contextId={`preset:${currentPreset.id}`}
+              contextType="preset"
               label={`Preset: ${currentPreset.name}`}
               resolvedParams={() => resolveAllParameters({ preset: currentPreset, currentLevel: 'preset' })}
               className="h-8 px-2.5 bg-[#101116] hover:bg-[#1C1D24] text-[#B1ACA3] hover:text-[#F45126] border border-[#292A30] text-xs font-mono"

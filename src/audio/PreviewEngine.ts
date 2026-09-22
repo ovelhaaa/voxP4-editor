@@ -1,15 +1,57 @@
 import {
   AuditionMode,
+  ContextType,
   PreviewEngineStatus,
   PreviewPlaybackState,
   ReferenceSample,
   RenderedAudio,
   VocalAudioSource,
 } from './types';
-import { decodeAudioBuffer } from './decodeAudio';
-import { computeRenderCacheKey, renderCache } from './renderCache';
+import { decodeAudioBuffer, computeAudioFileId } from './decodeAudio';
+import {
+  computePreviewFingerprint,
+  computeRenderCacheKey,
+  renderCache,
+  DEFAULT_DSP_BUILD_ID,
+} from './renderCache';
 import { loadReferenceAudioSource } from './referenceSamples';
 import { ResolvedParameterState } from '../domain/resolution';
+import compatibilityManifest from './wasm/dsp-compatibility.json';
+
+export class RenderSupersededError extends Error {
+  constructor(message = 'Preview render was superseded by a newer render request') {
+    super(message);
+    this.name = 'RenderSupersededError';
+  }
+}
+
+export class RenderCancelledError extends Error {
+  constructor(message = 'Preview render was cancelled') {
+    super(message);
+    this.name = 'RenderCancelledError';
+  }
+}
+
+interface PreviewRenderTask {
+  readonly taskId: string;
+  readonly cacheKey: string;
+  readonly contextFingerprint: string;
+  readonly contextId: string | null;
+  readonly contextType: ContextType | null;
+  readonly contextLabel: string;
+  readonly sourceId: string;
+  readonly frameCount: number;
+  readonly startFrame: number;
+  readonly parameters: Record<string, number>;
+  readonly resolve: (audio: RenderedAudio) => void;
+  readonly reject: (err: Error) => void;
+}
+
+export interface ContextOptions {
+  id?: string | null;
+  type?: ContextType | null;
+  label: string;
+}
 
 export class PreviewEngine {
   private static instance: PreviewEngine | null = null;
@@ -20,11 +62,15 @@ export class PreviewEngine {
   private state: PreviewPlaybackState = 'idle';
   private auditionMode: AuditionMode = 'processed';
   private activeSource: VocalAudioSource | null = null;
+  private activeContextId: string | null = null;
+  private activeContextType: ContextType | null = null;
   private activeContextLabel = 'No Sound Selected';
+  private activeResolvedParams: readonly ResolvedParameterState[] | null = null;
   private isLooping = false;
   private previewRegionSeconds = 20.0;
   private lastRenderTimeMs: number | null = null;
   private errorMessage: string | null = null;
+  private dspIncompatible = false;
 
   private renderedAudio: RenderedAudio | null = null;
   private dryBuffer: AudioBuffer | null = null;
@@ -37,16 +83,14 @@ export class PreviewEngine {
   private timeUpdateInterval: number | null = null;
 
   // Task tracking
-  private currentTaskId: string | null = null;
-  private pendingRenderPromise: {
-    resolve: (audio: RenderedAudio) => void;
-    reject: (err: Error) => void;
-  } | null = null;
+  private currentTask: PreviewRenderTask | null = null;
 
-  // Listeners
+  // Subscriptions
   private readonly listeners = new Set<(status: PreviewEngineStatus) => void>();
+  private readonly clockListeners = new Set<(currentTime: number) => void>();
 
   private constructor() {
+    this.validateDspManifest();
     this.initWorker();
   }
 
@@ -57,7 +101,32 @@ export class PreviewEngine {
     return PreviewEngine.instance;
   }
 
+  // ---------------------------------------------------------------------------
+  // Runtime Manifest Validation
+  // ---------------------------------------------------------------------------
+
+  private validateDspManifest(): void {
+    const m = compatibilityManifest as any;
+    const isEngineOk = m.engine === 'voxP4';
+    const isProfileOk = m.profile === 'P4Production';
+    const isRateOk = m.sampleRate === 48000;
+    const isBlockOk = m.blockSize === 64;
+    const isContractOk = m.contractVersion === 1;
+    const isParamCountOk = m.parameterCount === 71;
+    const isWasmShaOk = typeof m.wasmSha256 === 'string' && m.wasmSha256.length === 64;
+
+    if (!isEngineOk || !isProfileOk || !isRateOk || !isBlockOk || !isContractOk || !isParamCountOk || !isWasmShaOk) {
+      console.error('DSP compatibility manifest validation failed:', m);
+      this.dspIncompatible = true;
+      this.state = 'error';
+      this.errorMessage = 'Preview unavailable: DSP build is incompatible with this editor';
+    }
+  }
+
   private initWorker(): void {
+    if (this.dspIncompatible) return;
+    if (typeof Worker === 'undefined') return;
+
     try {
       this.worker = new Worker(new URL('./preview.worker.ts', import.meta.url), {
         type: 'module',
@@ -65,18 +134,25 @@ export class PreviewEngine {
 
       this.worker.onmessage = (event) => {
         const data = event.data;
-        if (data.type === 'RENDER_RESULT' && data.taskId === this.currentTaskId) {
+        if (data.type === 'RENDER_RESULT') {
           this.handleRenderSuccess(data);
-        } else if (data.type === 'RENDER_ERROR' && data.taskId === this.currentTaskId) {
-          this.handleRenderError(data.error);
+        } else if (data.type === 'RENDER_ERROR') {
+          this.handleRenderError(data.taskId, data.error);
         }
       };
 
       this.worker.onerror = (err) => {
         console.error('Preview worker error:', err);
-        this.handleRenderError(err.message || 'Worker thread error');
+        if (this.currentTask) {
+          const task = this.currentTask;
+          this.currentTask = null;
+          task.reject(new Error(err.message || 'Worker thread error'));
+        }
+        this.state = 'error';
+        this.errorMessage = 'Web Worker execution failed';
+        this.notifyListeners();
       };
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to create preview worker:', err);
       this.state = 'error';
       this.errorMessage = 'Web Worker initialization failed';
@@ -86,13 +162,20 @@ export class PreviewEngine {
 
   private getAudioContext(): AudioContext {
     if (!this.audioCtx) {
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtxClass =
+        (typeof window !== 'undefined' && ((window as any).AudioContext || (window as any).webkitAudioContext)) ||
+        (globalThis as any).AudioContext;
       this.audioCtx = new AudioCtxClass({ sampleRate: 48000 });
     }
-    if (this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume().catch(console.error);
+    return this.audioCtx!;
+  }
+
+  private ensureAudioContextResumed(): void {
+    if (this.audioCtx && this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch((err) => {
+        console.warn('AudioContext resume failed:', err);
+      });
     }
-    return this.audioCtx;
   }
 
   // ---------------------------------------------------------------------------
@@ -101,6 +184,8 @@ export class PreviewEngine {
 
   async loadReferenceSample(sample: ReferenceSample): Promise<void> {
     this.stop();
+    this.abortCurrentTask(new RenderCancelledError('Source changed to reference sample'));
+
     this.state = 'loading';
     this.errorMessage = null;
     this.notifyListeners();
@@ -119,6 +204,8 @@ export class PreviewEngine {
 
   async loadUserAudioFile(file: File): Promise<void> {
     this.stop();
+    this.abortCurrentTask(new RenderCancelledError('Source changed to uploaded user file'));
+
     this.state = 'loading';
     this.errorMessage = null;
     this.notifyListeners();
@@ -127,15 +214,15 @@ export class PreviewEngine {
       const ctx = this.getAudioContext();
       const arrayBuffer = await file.arrayBuffer();
       const decoded = await decodeAudioBuffer(arrayBuffer, ctx);
+      const uniqueId = await computeAudioFileId(file, arrayBuffer);
 
       const source: VocalAudioSource = {
-        id: `user-${file.name}-${file.size}-${file.lastModified}`,
+        id: uniqueId,
         name: file.name,
         type: 'user',
         duration: decoded.duration,
         sampleRate: decoded.sampleRate,
         samples: decoded.samples,
-        rawBuffer: decoded.originalBuffer,
       };
 
       this.setActiveSource(source);
@@ -148,13 +235,22 @@ export class PreviewEngine {
   }
 
   private setActiveSource(source: VocalAudioSource): void {
+    this.abortCurrentTask(new RenderCancelledError('Source changed'));
+
+    // Strict invariant: verify 48000 Hz sample rate
+    if (source.sampleRate !== 48000) {
+      this.state = 'error';
+      this.errorMessage = `Invalid audio sample rate: ${source.sampleRate} Hz (expected 48000 Hz)`;
+      this.notifyListeners();
+      return;
+    }
+
     this.activeSource = source;
     this.renderedAudio = null;
     this.dryBuffer = null;
     this.playbackOffset = 0;
     this.state = 'ready';
 
-    // Prepare dry audio buffer for preview region
     this.prepareDryBuffer();
     this.notifyListeners();
   }
@@ -175,138 +271,203 @@ export class PreviewEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Rendering
+  // Rendering & Concurrency
   // ---------------------------------------------------------------------------
 
+  private abortCurrentTask(error: Error): void {
+    if (this.currentTask) {
+      const task = this.currentTask;
+      this.currentTask = null;
+      if (this.worker) {
+        this.worker.postMessage({ type: 'CANCEL', taskId: task.taskId });
+      }
+      task.reject(error);
+    }
+  }
+
   /**
-   * Triggers preview render for the given resolved parameter state.
+   * Triggers preview render for the given context and resolved parameter state.
    */
   async requestRender(
-    contextLabel: string,
+    contextOrLabel: string | ContextOptions,
     resolvedParams: readonly ResolvedParameterState[]
   ): Promise<RenderedAudio | null> {
+    if (this.dspIncompatible) {
+      throw new Error(this.errorMessage || 'DSP build is incompatible');
+    }
+
+    let contextId: string | null = null;
+    let contextType: ContextType | null = null;
+    let contextLabel: string;
+
+    if (typeof contextOrLabel === 'string') {
+      contextLabel = contextOrLabel;
+    } else {
+      contextId = contextOrLabel.id || null;
+      contextType = contextOrLabel.type || null;
+      contextLabel = contextOrLabel.label;
+    }
+
+    this.activeContextId = contextId;
+    this.activeContextType = contextType;
     this.activeContextLabel = contextLabel;
+    this.activeResolvedParams = resolvedParams;
 
     if (!this.activeSource) {
       this.notifyListeners();
       return null;
     }
 
+    // Strict invariant check: active source sample rate must be 48000 Hz
+    if (this.activeSource.sampleRate !== 48000) {
+      const err = new Error(`Audio source sample rate is ${this.activeSource.sampleRate} Hz (expected 48000 Hz)`);
+      this.state = 'error';
+      this.errorMessage = err.message;
+      this.notifyListeners();
+      throw err;
+    }
+
     const numericParams = this.mapResolvedParameters(resolvedParams);
-    const sampleRate = this.activeSource.sampleRate;
     const frameCount = Math.min(
       this.activeSource.samples.length,
-      Math.round(this.previewRegionSeconds * sampleRate)
+      Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
     );
 
     const cacheKey = computeRenderCacheKey({
       sourceId: this.activeSource.id,
       startFrame: 0,
       frameCount,
-      dspVersion: '1.0',
+      dspBuildId: DEFAULT_DSP_BUILD_ID,
       parameters: numericParams,
     });
 
-    // Check in-memory cache first
+    const contextFingerprint = computePreviewFingerprint({
+      sourceId: this.activeSource.id,
+      startFrame: 0,
+      frameCount,
+      dspBuildId: DEFAULT_DSP_BUILD_ID,
+      parameters: numericParams,
+    });
+
+    // 1. Check in-memory LRU cache first
     const cached = renderCache.get(cacheKey);
     if (cached) {
       this.renderedAudio = cached;
       this.lastRenderTimeMs = cached.renderTimeMs;
       this.state = this.isPlaying ? 'playing' : 'rendered';
+      this.errorMessage = null;
       this.notifyListeners();
 
-      // If playing in processed mode, seamlessly update buffer
       if (this.isPlaying && this.auditionMode === 'processed') {
         this.restartActiveNode();
       }
       return cached;
     }
 
-    // Cancel any previous task running in worker
-    if (this.currentTaskId && this.worker) {
-      this.worker.postMessage({ type: 'CANCEL', taskId: this.currentTaskId });
-    }
+    // 2. Abort any previous pending render task with RenderSupersededError
+    this.abortCurrentTask(new RenderSupersededError());
 
+    // 3. Initiate new render task
     const taskId = `task-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    this.currentTaskId = taskId;
     this.state = 'rendering';
     this.notifyListeners();
 
-    const inputSlice = this.activeSource.samples.slice(0, frameCount);
+    // Create an independent copy to transfer to worker safely without detaching activeSource.samples
+    const inputSlice = new Float32Array(this.activeSource.samples.subarray(0, frameCount));
 
     return new Promise<RenderedAudio>((resolve, reject) => {
-      this.pendingRenderPromise = { resolve, reject };
+      const task: PreviewRenderTask = {
+        taskId,
+        cacheKey,
+        contextFingerprint,
+        contextId,
+        contextType,
+        contextLabel,
+        sourceId: this.activeSource!.id,
+        frameCount,
+        startFrame: 0,
+        parameters: numericParams,
+        resolve,
+        reject,
+      };
+
+      this.currentTask = task;
 
       if (!this.worker) {
-        this.handleRenderError('Worker not available');
+        this.currentTask = null;
+        this.state = 'error';
+        this.errorMessage = 'Worker not available';
+        this.notifyListeners();
+        reject(new Error('Preview worker is not available'));
         return;
       }
 
-      this.worker.postMessage({
-        type: 'RENDER',
-        taskId,
-        input: inputSlice,
-        parameters: numericParams,
-      });
+      this.worker.postMessage(
+        {
+          type: 'RENDER',
+          taskId,
+          cacheKey,
+          contextFingerprint,
+          input: inputSlice,
+          parameters: numericParams,
+        },
+        [inputSlice.buffer]
+      );
     });
   }
 
   private handleRenderSuccess(data: any): void {
-    const { taskId, left, right, renderTimeMs } = data;
-    if (taskId !== this.currentTaskId || !this.activeSource) return;
+    const { taskId, cacheKey, contextFingerprint, left, right, duration, tailDurationSeconds, renderTimeMs } = data;
 
-    const ctx = this.getAudioContext();
-    const frames = left.length;
-    const buf = ctx.createBuffer(2, frames, this.activeSource.sampleRate);
-    buf.copyToChannel(left, 0);
-    buf.copyToChannel(right, 1);
+    // Discard result if task was superseded or source changed
+    if (!this.currentTask || this.currentTask.taskId !== taskId || !this.activeSource) {
+      return;
+    }
 
-    const numericParams = {};
-    const cacheKey = computeRenderCacheKey({
-      sourceId: this.activeSource.id,
-      startFrame: 0,
-      frameCount: frames,
-      dspVersion: '1.0',
-      parameters: numericParams,
-    });
+    const task = this.currentTask;
+    this.currentTask = null;
+
+    // Store in cache using the original immutable cacheKey and fingerprint
+    const finalCacheKey = task.cacheKey || cacheKey;
+    const finalFingerprint = task.contextFingerprint || contextFingerprint;
 
     const rendered: RenderedAudio = {
       sourceId: this.activeSource.id,
-      cacheKey,
-      duration: frames / this.activeSource.sampleRate,
+      cacheKey: finalCacheKey,
+      fingerprint: finalFingerprint,
+      duration: duration || left.length / this.activeSource.sampleRate,
+      tailDurationSeconds: tailDurationSeconds || 0,
       sampleRate: this.activeSource.sampleRate,
       left,
       right,
       renderTimeMs,
-      audioBuffer: buf,
     };
 
-    renderCache.set(cacheKey, rendered);
+    renderCache.set(finalCacheKey, rendered);
     this.renderedAudio = rendered;
     this.lastRenderTimeMs = renderTimeMs;
     this.state = this.isPlaying ? 'playing' : 'rendered';
     this.errorMessage = null;
 
-    if (this.pendingRenderPromise) {
-      this.pendingRenderPromise.resolve(rendered);
-      this.pendingRenderPromise = null;
-    }
-
+    task.resolve(rendered);
     this.notifyListeners();
 
-    // If currently playing in processed mode, seamlessly update node
     if (this.isPlaying && this.auditionMode === 'processed') {
       this.restartActiveNode();
     }
   }
 
-  private handleRenderError(errorMsg: string): void {
+  private handleRenderError(taskId: string, errorMsg: string): void {
+    if (!this.currentTask || this.currentTask.taskId !== taskId) {
+      return;
+    }
+
+    const task = this.currentTask;
+    this.currentTask = null;
+
     this.state = 'error';
     this.errorMessage = errorMsg;
-    if (this.pendingRenderPromise) {
-      this.pendingRenderPromise.reject(new Error(errorMsg));
-      this.pendingRenderPromise = null;
-    }
+    task.reject(new Error(errorMsg));
     this.notifyListeners();
   }
 
@@ -315,6 +476,7 @@ export class PreviewEngine {
   // ---------------------------------------------------------------------------
 
   play(): void {
+    this.ensureAudioContextResumed();
     const buffer = this.getActiveBuffer();
     if (!buffer) return;
 
@@ -331,7 +493,7 @@ export class PreviewEngine {
     node.loop = this.isLooping;
     node.connect(ctx.destination);
 
-    // If offset is at or past end, wrap to beginning
+    // Clamp offset to valid duration
     if (this.playbackOffset >= buffer.duration) {
       this.playbackOffset = 0;
     }
@@ -355,7 +517,7 @@ export class PreviewEngine {
   pause(): void {
     if (!this.isPlaying) return;
     const ctx = this.getAudioContext();
-    this.playbackOffset = ctx.currentTime - this.playbackStartTime;
+    this.playbackOffset = Math.max(0, ctx.currentTime - this.playbackStartTime);
 
     if (this.currentSourceNode) {
       try {
@@ -385,15 +547,18 @@ export class PreviewEngine {
     this.state = this.renderedAudio ? 'rendered' : this.activeSource ? 'ready' : 'idle';
     this.stopTimeTracker();
     this.notifyListeners();
+    this.notifyClockListeners(0);
   }
 
   seek(seconds: number): void {
-    const duration = this.getPreviewDuration();
+    this.ensureAudioContextResumed();
+    const duration = this.getPlaybackDuration();
     this.playbackOffset = Math.max(0, Math.min(seconds, duration));
 
     if (this.isPlaying) {
       this.restartActiveNode();
     } else {
+      this.notifyClockListeners(this.playbackOffset);
       this.notifyListeners();
     }
   }
@@ -401,6 +566,12 @@ export class PreviewEngine {
   setAuditionMode(mode: AuditionMode): void {
     if (this.auditionMode === mode) return;
     this.auditionMode = mode;
+
+    // Clamping: when switching Processed -> Dry, ensure offset doesn't exceed dry duration
+    const dryDuration = this.getDryDuration();
+    if (mode === 'dry' && this.playbackOffset > dryDuration) {
+      this.playbackOffset = Math.max(0, dryDuration - 0.05);
+    }
 
     if (this.isPlaying) {
       this.restartActiveNode();
@@ -452,7 +623,20 @@ export class PreviewEngine {
     if (this.auditionMode === 'dry') {
       return this.dryBuffer;
     }
-    return this.renderedAudio?.audioBuffer ?? this.dryBuffer;
+
+    if (this.renderedAudio) {
+      if (!this.renderedAudio.audioBuffer) {
+        const ctx = this.getAudioContext();
+        const frames = this.renderedAudio.left.length;
+        const buf = ctx.createBuffer(2, frames, this.renderedAudio.sampleRate);
+        buf.copyToChannel(new Float32Array(this.renderedAudio.left), 0);
+        buf.copyToChannel(new Float32Array(this.renderedAudio.right), 1);
+        this.renderedAudio.audioBuffer = buf;
+      }
+      return this.renderedAudio.audioBuffer;
+    }
+
+    return this.dryBuffer;
   }
 
   getCurrentTime(): number {
@@ -460,20 +644,33 @@ export class PreviewEngine {
       return this.playbackOffset;
     }
     const elapsed = this.audioCtx.currentTime - this.playbackStartTime;
-    const dur = this.getPreviewDuration();
+    const dur = this.getPlaybackDuration();
     if (dur <= 0) return 0;
     return this.isLooping ? elapsed % dur : Math.min(elapsed, dur);
   }
 
-  getPreviewDuration(): number {
+  getDryDuration(): number {
     if (!this.activeSource) return 0;
     return Math.min(this.previewRegionSeconds, this.activeSource.duration);
   }
 
+  getPlaybackDuration(): number {
+    if (!this.activeSource) return 0;
+    if (this.auditionMode === 'processed' && this.renderedAudio) {
+      return this.renderedAudio.duration;
+    }
+    return this.getDryDuration();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Clock Tracker & Subscriptions
+  // ---------------------------------------------------------------------------
+
   private startTimeTracker(): void {
     this.stopTimeTracker();
     this.timeUpdateInterval = window.setInterval(() => {
-      this.notifyListeners();
+      const curTime = this.getCurrentTime();
+      this.notifyClockListeners(curTime);
     }, 50);
   }
 
@@ -483,10 +680,6 @@ export class PreviewEngine {
       this.timeUpdateInterval = null;
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Parameter Conversion Helper
-  // ---------------------------------------------------------------------------
 
   private mapResolvedParameters(
     resolved: readonly ResolvedParameterState[]
@@ -510,31 +703,81 @@ export class PreviewEngine {
     return result;
   }
 
+  public computeCurrentFingerprint(): string | null {
+    if (!this.activeSource || !this.activeResolvedParams) {
+      return null;
+    }
+    const numericParams = this.mapResolvedParameters(this.activeResolvedParams);
+    const frameCount = Math.min(
+      this.activeSource.samples.length,
+      Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
+    );
+
+    return computePreviewFingerprint({
+      sourceId: this.activeSource.id,
+      startFrame: 0,
+      frameCount,
+      dspBuildId: DEFAULT_DSP_BUILD_ID,
+      parameters: numericParams,
+    });
+  }
+
+  isRenderCurrent(fingerprint: string | null): boolean {
+    if (!this.renderedAudio || !fingerprint) return false;
+    return this.renderedAudio.fingerprint === fingerprint;
+  }
+
   // ---------------------------------------------------------------------------
-  // Status & Subscription
+  // Status & Subscription Channels
   // ---------------------------------------------------------------------------
 
   getStatus(): PreviewEngineStatus {
+    const currentFingerprint = this.computeCurrentFingerprint();
+    const renderedFp = this.renderedAudio?.fingerprint || null;
+    const isStale = Boolean(renderedFp && currentFingerprint && renderedFp !== currentFingerprint);
+
     return {
       state: this.state,
       auditionMode: this.auditionMode,
       activeSource: this.activeSource,
+      activeContextId: this.activeContextId,
+      activeContextType: this.activeContextType,
       activeContextLabel: this.activeContextLabel,
       isLooping: this.isLooping,
       currentTime: this.getCurrentTime(),
-      duration: this.getPreviewDuration(),
+      duration: this.getPlaybackDuration(),
       previewRegionSeconds: this.previewRegionSeconds,
+      tailDurationSeconds: this.renderedAudio?.tailDurationSeconds || 0,
       isRendering: this.state === 'rendering',
       errorMessage: this.errorMessage,
       lastRenderTimeMs: this.lastRenderTimeMs,
+      renderedFingerprint: renderedFp,
+      requestedFingerprint: currentFingerprint,
+      isPreviewStale: isStale,
     };
   }
 
+  /**
+   * Subscribes to low-frequency state transitions.
+   * Does NOT fire on every 50ms playhead tick, preventing needless UI re-renders.
+   */
   subscribe(listener: (status: PreviewEngineStatus) => void): () => void {
     this.listeners.add(listener);
     listener(this.getStatus());
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Subscribes to high-frequency playhead clock updates (50ms).
+   * Used exclusively by transport scrubbers and timers.
+   */
+  subscribeClock(listener: (currentTime: number) => void): () => void {
+    this.clockListeners.add(listener);
+    listener(this.getCurrentTime());
+    return () => {
+      this.clockListeners.delete(listener);
     };
   }
 
@@ -545,6 +788,16 @@ export class PreviewEngine {
         listener(status);
       } catch (err) {
         console.error('Error in PreviewEngine listener:', err);
+      }
+    }
+  }
+
+  private notifyClockListeners(time: number): void {
+    for (const listener of this.clockListeners) {
+      try {
+        listener(time);
+      } catch (err) {
+        console.error('Error in PreviewEngine clock listener:', err);
       }
     }
   }
