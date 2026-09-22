@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import {
   Play,
   Pause,
@@ -26,6 +26,8 @@ import {
   getReferenceSamples,
 } from '../../audio/referenceSamples';
 import { resolveAllParameters } from '../../domain/resolution';
+import { canonicalizeParameters } from '../../audio/renderCache';
+import { mapResolvedParameters } from '../../audio/parameterMapping';
 
 export const VocalPreviewPanel: React.FC = () => {
   const { state } = useEditor();
@@ -88,8 +90,9 @@ export const VocalPreviewPanel: React.FC = () => {
     }
   }, [referenceSamples, status.activeSource]);
 
-  // Determine current active entity & label for preview
-  const getActiveContext = () => {
+  // Determine current active entity & label for preview. Recomputes whenever
+  // the underlying library (and therefore parameters) or selection changes.
+  const activeContext = useMemo(() => {
     if (selection.type === 'preset') {
       const preset = library.presets.find((p) => p.id === selection.id) || library.presets[0];
       if (preset) {
@@ -142,10 +145,30 @@ export const VocalPreviewPanel: React.FC = () => {
     }
 
     return null;
-  };
+  }, [selection.type, selection.id, selection.subsceneId, library]);
+
+  // Stable signature of the resolved DSP parameters (independent of the label or
+  // context identity) so cosmetic renames never look like a DSP change.
+  const activeParamsSignature = useMemo(() => {
+    if (!activeContext) return '';
+    return canonicalizeParameters(mapResolvedParameters(activeContext.params));
+  }, [activeContext]);
+
+  // Push requested preview state into the engine whenever the effective editor
+  // state changes. This never triggers a render; it only updates staleness.
+  useEffect(() => {
+    if (!activeContext) {
+      previewEngine.clearRequestedContext();
+      return;
+    }
+    previewEngine.updateRequestedContext(
+      { id: activeContext.id, type: activeContext.type, label: activeContext.label },
+      activeContext.params
+    );
+  }, [activeContext?.id, activeContext?.type, activeContext?.label, activeParamsSignature]);
 
   const handleRenderAndPlay = async () => {
-    const ctx = getActiveContext();
+    const ctx = activeContext;
     if (!ctx) return;
 
     if (status.state === 'playing') {
@@ -185,7 +208,7 @@ export const VocalPreviewPanel: React.FC = () => {
   };
 
   const handleRenderOnly = async () => {
-    const ctx = getActiveContext();
+    const ctx = activeContext;
     if (!ctx) return;
     try {
       await previewEngine.requestRender(
@@ -222,7 +245,7 @@ export const VocalPreviewPanel: React.FC = () => {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${tenths}`;
   };
 
-  const activeCtx = getActiveContext();
+  const activeCtx = activeContext;
   const currentDuration = status.duration || 1;
   const currentProgress = Math.min(currentTime / currentDuration, 1.0);
 

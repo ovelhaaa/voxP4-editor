@@ -16,6 +16,7 @@ import {
 } from './renderCache';
 import { loadReferenceAudioSource } from './referenceSamples';
 import { ResolvedParameterState } from '../domain/resolution';
+import { mapResolvedParameters } from './parameterMapping';
 import compatibilityManifest from './wasm/dsp-compatibility.json';
 
 export class RenderSupersededError extends Error {
@@ -74,6 +75,12 @@ export class PreviewEngine {
 
   private renderedAudio: RenderedAudio | null = null;
   private dryBuffer: AudioBuffer | null = null;
+
+  // Transient playback buffer for the currently active render only.
+  // PCM stays in the render cache as Float32Array; this AudioBuffer is
+  // recreated on demand and never persisted per cache entry.
+  private activePlaybackBuffer: AudioBuffer | null = null;
+  private activePlaybackFingerprint: string | null = null;
 
   // Playback nodes
   private currentSourceNode: AudioBufferSourceNode | null = null;
@@ -248,11 +255,26 @@ export class PreviewEngine {
     this.activeSource = source;
     this.renderedAudio = null;
     this.dryBuffer = null;
+    this.activePlaybackBuffer = null;
+    this.activePlaybackFingerprint = null;
     this.playbackOffset = 0;
     this.state = 'ready';
 
     this.prepareDryBuffer();
     this.notifyListeners();
+  }
+
+  /**
+   * Installs a newly rendered/active audio entry. The transient playback
+   * buffer is invalidated only when the audio fingerprint actually changes,
+   * so cached PCM for an identical configuration is not re-wrapped needlessly.
+   */
+  private setRenderedAudio(audio: RenderedAudio): void {
+    if (this.renderedAudio?.fingerprint !== audio.fingerprint) {
+      this.activePlaybackBuffer = null;
+      this.activePlaybackFingerprint = null;
+    }
+    this.renderedAudio = audio;
   }
 
   private prepareDryBuffer(): void {
@@ -264,7 +286,8 @@ export class PreviewEngine {
     );
 
     const buf = ctx.createBuffer(2, frames, this.activeSource.sampleRate);
-    const monoSlice = new Float32Array(this.activeSource.samples.subarray(0, frames));
+    // Channel data is copied by copyToChannel; no intermediate clone is required.
+    const monoSlice = this.activeSource.samples.subarray(0, frames) as Float32Array<ArrayBuffer>;
     buf.copyToChannel(monoSlice, 0);
     buf.copyToChannel(monoSlice, 1);
     this.dryBuffer = buf;
@@ -283,6 +306,40 @@ export class PreviewEngine {
       }
       task.reject(error);
     }
+  }
+
+  /**
+   * Updates the "requested preview state" without triggering any render.
+   *
+   * This is the canonical way for UI/editor state to push the currently desired
+   * context and DSP parameter values into the engine. Stale state is derived
+   * implicitly by `getStatus()` comparing the requested fingerprint against the
+   * last rendered fingerprint.
+   *
+   * Renaming a context or switching to a different entity that resolves to the
+   * same DSP parameters does NOT change the audio fingerprint.
+   */
+  updateRequestedContext(
+    context: { id: string | null; type: ContextType | null; label: string },
+    resolvedParams: readonly ResolvedParameterState[]
+  ): void {
+    this.activeContextId = context.id ?? null;
+    this.activeContextType = context.type ?? null;
+    this.activeContextLabel = context.label;
+    this.activeResolvedParams = resolvedParams;
+    this.notifyListeners();
+  }
+
+  /**
+   * Clears the requested preview context (e.g. nothing is auditionable).
+   * Does not stop playback or trigger a render.
+   */
+  clearRequestedContext(): void {
+    this.activeContextId = null;
+    this.activeContextType = null;
+    this.activeContextLabel = 'No Sound Selected';
+    this.activeResolvedParams = null;
+    this.notifyListeners();
   }
 
   /**
@@ -327,7 +384,7 @@ export class PreviewEngine {
       throw err;
     }
 
-    const numericParams = this.mapResolvedParameters(resolvedParams);
+    const numericParams = mapResolvedParameters(resolvedParams);
     const frameCount = Math.min(
       this.activeSource.samples.length,
       Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
@@ -352,7 +409,7 @@ export class PreviewEngine {
     // 1. Check in-memory LRU cache first
     const cached = renderCache.get(cacheKey);
     if (cached) {
-      this.renderedAudio = cached;
+      this.setRenderedAudio(cached);
       this.lastRenderTimeMs = cached.renderTimeMs;
       this.state = this.isPlaying ? 'playing' : 'rendered';
       this.errorMessage = null;
@@ -444,7 +501,7 @@ export class PreviewEngine {
     };
 
     renderCache.set(finalCacheKey, rendered);
-    this.renderedAudio = rendered;
+    this.setRenderedAudio(rendered);
     this.lastRenderTimeMs = renderTimeMs;
     this.state = this.isPlaying ? 'playing' : 'rendered';
     this.errorMessage = null;
@@ -624,16 +681,23 @@ export class PreviewEngine {
       return this.dryBuffer;
     }
 
-    if (this.renderedAudio) {
-      if (!this.renderedAudio.audioBuffer) {
-        const ctx = this.getAudioContext();
-        const frames = this.renderedAudio.left.length;
-        const buf = ctx.createBuffer(2, frames, this.renderedAudio.sampleRate);
-        buf.copyToChannel(new Float32Array(this.renderedAudio.left), 0);
-        buf.copyToChannel(new Float32Array(this.renderedAudio.right), 1);
-        this.renderedAudio.audioBuffer = buf;
+    const rendered = this.renderedAudio;
+    if (rendered) {
+      if (this.activePlaybackBuffer && this.activePlaybackFingerprint === rendered.fingerprint) {
+        return this.activePlaybackBuffer;
       }
-      return this.renderedAudio.audioBuffer;
+
+      const ctx = this.getAudioContext();
+      const frames = rendered.left.length;
+      const buf = ctx.createBuffer(2, frames, rendered.sampleRate);
+      // `left`/`right` are already Float32Array; copy directly without a temporary clone.
+      // The DOM lib narrows copyToChannel to Float32Array<ArrayBuffer>, which our
+      // PCM views always satisfy at runtime.
+      buf.copyToChannel(rendered.left as Float32Array<ArrayBuffer>, 0);
+      buf.copyToChannel(rendered.right as Float32Array<ArrayBuffer>, 1);
+      this.activePlaybackBuffer = buf;
+      this.activePlaybackFingerprint = rendered.fingerprint;
+      return buf;
     }
 
     return this.dryBuffer;
@@ -681,33 +745,11 @@ export class PreviewEngine {
     }
   }
 
-  private mapResolvedParameters(
-    resolved: readonly ResolvedParameterState[]
-  ): Record<string, number> {
-    const result: Record<string, number> = {};
-
-    for (const r of resolved) {
-      const desc = r.descriptor;
-      const val = r.resolvedValue;
-
-      if (desc.type === 'bool') {
-        result[desc.key] = val ? 1.0 : 0.0;
-      } else if (desc.type === 'enum') {
-        const idx = desc.values ? desc.values.indexOf(String(val)) : -1;
-        result[desc.key] = idx >= 0 ? idx : desc.default;
-      } else {
-        result[desc.key] = typeof val === 'number' && Number.isFinite(val) ? val : desc.default;
-      }
-    }
-
-    return result;
-  }
-
   public computeCurrentFingerprint(): string | null {
     if (!this.activeSource || !this.activeResolvedParams) {
       return null;
     }
-    const numericParams = this.mapResolvedParameters(this.activeResolvedParams);
+    const numericParams = mapResolvedParameters(this.activeResolvedParams);
     const frameCount = Math.min(
       this.activeSource.samples.length,
       Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)

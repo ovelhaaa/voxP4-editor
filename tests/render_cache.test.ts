@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { computeRenderCacheKey, RenderCache } from '../src/audio/renderCache';
+import {
+  computeRenderCacheKey,
+  RenderCache,
+  estimateRenderedAudioBytes,
+  DEFAULT_CACHE_MAX_BYTES,
+} from '../src/audio/renderCache';
 import { RenderedAudio } from '../src/audio/types';
 
 describe('Render Cache & Deterministic Hash Key', () => {
@@ -130,5 +135,36 @@ describe('Render Cache & Deterministic Hash Key', () => {
     expect(cache.has('k4')).toBe(true);
     expect(cache.size).toBe(3);
     expect(cache.byteSize).toBeLessThanOrEqual(budgetFor3);
+  });
+
+  it('accounts only real PCM bytes (no hidden per-entry AudioBuffer) for a 20 s stereo render', () => {
+    const frames = 20 * 48000;
+    const audio: RenderedAudio = {
+      sourceId: 's1',
+      cacheKey: 'k1',
+      fingerprint: 'fp1',
+      duration: 20,
+      tailDurationSeconds: 0,
+      sampleRate: 48000,
+      left: new Float32Array(frames),
+      right: new Float32Array(frames),
+      renderTimeMs: 500,
+    };
+
+    const expectedPcmBytes = frames * 2 * 4; // 7.68 MB
+    expect(audio.left.byteLength + audio.right.byteLength).toBe(expectedPcmBytes);
+    expect(expectedPcmBytes).toBe(7_680_000);
+
+    // The estimate tracks the PCM payload (plus small metadata), never a second copy.
+    const estimated = estimateRenderedAudioBytes(audio);
+    expect(estimated).toBeGreaterThanOrEqual(expectedPcmBytes);
+    expect(estimated).toBeLessThan(expectedPcmBytes + 2048);
+
+    // Cached entries must not hold a persistent AudioBuffer field.
+    expect('audioBuffer' in audio).toBe(false);
+
+    // The 96 MB budget represents ~12 full-length 20 s stereo renders of PCM.
+    const perRender = estimateRenderedAudioBytes(audio);
+    expect(Math.floor(DEFAULT_CACHE_MAX_BYTES / perRender)).toBeGreaterThanOrEqual(10);
   });
 });

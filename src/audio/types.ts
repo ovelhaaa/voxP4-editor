@@ -51,7 +51,6 @@ export interface RenderedAudio {
   readonly left: Float32Array;
   readonly right: Float32Array;
   readonly renderTimeMs: number;
-  audioBuffer?: AudioBuffer;
 }
 
 export interface PreviewEngineStatus {

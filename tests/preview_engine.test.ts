@@ -78,6 +78,9 @@ describe('PreviewEngine Hardening & Integration Suite', () => {
     (engine as any).activeSource = null;
     (engine as any).renderedAudio = null;
     (engine as any).isPlaying = false;
+    (engine as any).auditionMode = 'processed';
+    (engine as any).activePlaybackBuffer = null;
+    (engine as any).activePlaybackFingerprint = null;
     (engine as any).state = 'idle';
     (engine as any).activeContextId = null;
     (engine as any).activeResolvedParams = null;
@@ -176,17 +179,161 @@ describe('PreviewEngine Hardening & Integration Suite', () => {
     await promise;
     expect(engine.getStatus().isPreviewStale).toBe(false);
 
-    // Change parameter on same preset
+    // Change parameter on same preset through the public requested-context API
     const paramsModified = resolveAllParameters({
       preset: { id: 'p1', name: 'P1', parameters: { ReverbWet: 0.7 } },
       currentLevel: 'preset',
     });
 
-    // Update active context params in engine
-    (engine as any).activeResolvedParams = paramsModified;
+    engine.updateRequestedContext({ id: 'preset:p1', type: 'preset', label: 'P1' }, paramsModified);
 
     // Now engine detects stale preview
     expect(engine.getStatus().isPreviewStale).toBe(true);
+  });
+
+  it('integrates requested context with the render lifecycle for stale detection (public API only)', async () => {
+    const source = createMockSource('source-public-stale', 48000, 5.0);
+    (engine as any).setActiveSource(source);
+
+    const paramsA = resolveAllParameters({
+      preset: { id: 'p1', name: 'P1', parameters: { ReverbWet: 0.2 } },
+      currentLevel: 'preset',
+    });
+
+    engine.updateRequestedContext({ id: 'preset:p1', type: 'preset', label: 'P1' }, paramsA);
+    const renderPromise = engine.requestRender(
+      { id: 'preset:p1', type: 'preset', label: 'P1' },
+      paramsA
+    );
+
+    const taskA = mockWorker.messagesSent[0];
+    (engine as any).handleRenderSuccess({
+      taskId: taskA.taskId,
+      cacheKey: taskA.cacheKey,
+      contextFingerprint: taskA.contextFingerprint,
+      left: new Float32Array(1000),
+      right: new Float32Array(1000),
+      duration: 1000 / 48000,
+      tailDurationSeconds: 0,
+      renderTimeMs: 9,
+    });
+    await renderPromise;
+    expect(engine.getStatus().isPreviewStale).toBe(false);
+
+    // DSP parameter changed via editor state -> immediately stale
+    const paramsB = resolveAllParameters({
+      preset: { id: 'p1', name: 'P1', parameters: { ReverbWet: 0.8 } },
+      currentLevel: 'preset',
+    });
+    engine.updateRequestedContext({ id: 'preset:p1', type: 'preset', label: 'P1' }, paramsB);
+    expect(engine.getStatus().isPreviewStale).toBe(true);
+
+    // Re-render with new parameters -> not stale again
+    const renderPromiseB = engine.requestRender(
+      { id: 'preset:p1', type: 'preset', label: 'P1' },
+      paramsB
+    );
+    const taskB = mockWorker.messagesSent[1];
+    (engine as any).handleRenderSuccess({
+      taskId: taskB.taskId,
+      cacheKey: taskB.cacheKey,
+      contextFingerprint: taskB.contextFingerprint,
+      left: new Float32Array(1000),
+      right: new Float32Array(1000),
+      duration: 1000 / 48000,
+      tailDurationSeconds: 0,
+      renderTimeMs: 9,
+    });
+    await renderPromiseB;
+    expect(engine.getStatus().isPreviewStale).toBe(false);
+  });
+
+  it('does not mark audio stale when only the context identity/label changes (rename)', async () => {
+    const source = createMockSource('source-rename', 48000, 5.0);
+    (engine as any).setActiveSource(source);
+
+    const params = resolveAllParameters({
+      preset: { id: 'p1', name: 'Warm Vocal', parameters: { ReverbWet: 0.3 } },
+      currentLevel: 'preset',
+    });
+
+    engine.updateRequestedContext({ id: 'preset:p1', type: 'preset', label: 'Warm Vocal' }, params);
+    const promise = engine.requestRender(
+      { id: 'preset:p1', type: 'preset', label: 'Warm Vocal' },
+      params
+    );
+    const task = mockWorker.messagesSent[0];
+    (engine as any).handleRenderSuccess({
+      taskId: task.taskId,
+      cacheKey: task.cacheKey,
+      contextFingerprint: task.contextFingerprint,
+      left: new Float32Array(500),
+      right: new Float32Array(500),
+      duration: 500 / 48000,
+      tailDurationSeconds: 0,
+      renderTimeMs: 5,
+    });
+    const rendered = await promise;
+    const fingerprintBefore = rendered.fingerprint;
+
+    // Rename only: same DSP params, new id/label
+    engine.updateRequestedContext(
+      { id: 'preset:p1-renamed', type: 'preset', label: 'Warm Vocal Live' },
+      params
+    );
+
+    const status = engine.getStatus();
+    expect(status.isPreviewStale).toBe(false);
+    expect(status.activeContextId).toBe('preset:p1-renamed');
+    expect(status.activeContextLabel).toBe('Warm Vocal Live');
+    expect(engine.computeCurrentFingerprint()).toBe(fingerprintBefore);
+  });
+
+  it('reuses cached audio for different contexts that resolve to identical DSP parameters', async () => {
+    const source = createMockSource('source-equivalent', 48000, 5.0);
+    (engine as any).setActiveSource(source);
+
+    const paramsA = resolveAllParameters({
+      preset: { id: 'pA', name: 'Preset A', parameters: { DelayWet: 0.4 } },
+      currentLevel: 'preset',
+    });
+    const paramsB = resolveAllParameters({
+      preset: { id: 'pB', name: 'Preset B', parameters: { DelayWet: 0.4 } },
+      currentLevel: 'preset',
+    });
+
+    engine.updateRequestedContext({ id: 'preset:pA', type: 'preset', label: 'Preset A' }, paramsA);
+    const promiseA = engine.requestRender(
+      { id: 'preset:pA', type: 'preset', label: 'Preset A' },
+      paramsA
+    );
+    const taskA = mockWorker.messagesSent[0];
+    (engine as any).handleRenderSuccess({
+      taskId: taskA.taskId,
+      cacheKey: taskA.cacheKey,
+      contextFingerprint: taskA.contextFingerprint,
+      left: new Float32Array(800),
+      right: new Float32Array(800),
+      duration: 800 / 48000,
+      tailDurationSeconds: 0,
+      renderTimeMs: 7,
+    });
+    const audioA = await promiseA;
+    expect(mockWorker.messagesSent.length).toBe(1);
+
+    // Preset B has identical DSP params -> cache hit, UI identity still updates.
+    const audioB = await engine.requestRender(
+      { id: 'preset:pB', type: 'preset', label: 'Preset B' },
+      paramsB
+    );
+
+    expect(mockWorker.messagesSent.length).toBe(1); // no new render
+    expect(audioB).toBe(audioA); // same cached PCM
+    const status = engine.getStatus();
+    expect(status.activeContextId).toBe('preset:pB');
+    expect(status.activeContextLabel).toBe('Preset B');
+    expect(status.isPreviewStale).toBe(false);
+    expect(engine.computeCurrentFingerprint()).toBe(audioA.fingerprint);
   });
 
   it('handles concurrent renders safely: supersedes old task with RenderSupersededError', async () => {
@@ -371,5 +518,45 @@ describe('PreviewEngine Hardening & Integration Suite', () => {
     await expect(pending).rejects.toThrow();
     expect(engine.getStatus().state).toBe('ready');
     expect(engine.getStatus().renderedFingerprint).toBeNull();
+  });
+
+  it('keeps a single transient playback AudioBuffer and never stores one on cache entries', async () => {
+    const source = createMockSource('source-buffer', 48000, 5.0);
+    (engine as any).setActiveSource(source);
+
+    let createCount = 0;
+    const ctx = (engine as any).audioCtx;
+    const originalCreate = ctx.createBuffer.bind(ctx);
+    ctx.createBuffer = (...args: any[]) => {
+      createCount++;
+      return originalCreate(...args);
+    };
+
+    const params = resolveAllParameters({
+      preset: { id: 'p1', name: 'P1', parameters: { ReverbWet: 0.3 } },
+      currentLevel: 'preset',
+    });
+    const promise = engine.requestRender({ id: 'preset:p1', label: 'P1' }, params);
+    const task = mockWorker.messagesSent[0];
+    (engine as any).handleRenderSuccess({
+      taskId: task.taskId,
+      cacheKey: task.cacheKey,
+      contextFingerprint: task.contextFingerprint,
+      left: new Float32Array(1200),
+      right: new Float32Array(1200),
+      duration: 1200 / 48000,
+      tailDurationSeconds: 0,
+      renderTimeMs: 6,
+    });
+    const rendered = await promise;
+
+    expect('audioBuffer' in rendered).toBe(false);
+
+    const first = (engine as any).getActiveBuffer();
+    const second = (engine as any).getActiveBuffer();
+    expect(first).toBe(second);
+    expect(createCount).toBe(1);
+
+    expect('audioBuffer' in renderCache.get(rendered.cacheKey)!).toBe(false);
   });
 });

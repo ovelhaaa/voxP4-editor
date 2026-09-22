@@ -135,7 +135,7 @@ Builds the strictly typed, optimized single-page application into `dist/`.
 ```bash
 npm test
 ```
-Executes all 8 test suites (30 unit and integration tests) using Vitest.
+Executes all 17 test suites (92 unit and integration tests) using Vitest.
 
 ### Update Contracts
 ```bash
@@ -143,6 +143,28 @@ npm run update-contracts
 # or specify an explicit path:
 npm run update-contracts -- --source ../voxP4-control
 ```
+
+### Verify WASM Artifacts
+```bash
+npm run verify:wasm
+```
+Recalculates the real SHA-256 of `src/audio/wasm/voxp4-preview.wasm` and
+`contracts/voxp4-parameters-v1.json` and compares them against
+`src/audio/wasm/dsp-compatibility.json`. CI runs this before the tests and fails
+on any mismatch (WASM changed without manifest, contract changed without manifest,
+or an invalid manifest).
+
+### Update the WASM Preview Package
+From the `voxP4` repository, `scripts/build-wasm.bat` builds the DSP, generates
+`dsp-compatibility.json`, and synchronizes the three-file package into this
+editor. To sync an already-built package manually:
+```bash
+npm run sync-wasm -- <package-dir>
+```
+The package directory must contain `voxp4-preview.mjs`, `voxp4-preview.wasm`, and
+`dsp-compatibility.json`. All files are validated (hashes, profile, contract
+version, parameter count, sample rate, block size) before any artifact is
+replaced, so a partial or mismatched update is impossible.
 
 ---
 

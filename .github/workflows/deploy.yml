@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify WASM artifacts and contract hashes
+        run: npm run verify:wasm
+
       - name: Run automated test suite
         run: npm test
 

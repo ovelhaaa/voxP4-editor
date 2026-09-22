@@ -1,5 +1,12 @@
 import createVoxP4Module from './wasm/voxp4-preview.mjs';
 import wasmUrl from './wasm/voxp4-preview.wasm?url';
+import {
+  estimateMaxTailSeconds,
+  estimateMinTailCheckSeconds,
+  estimateMinSilenceSeconds,
+  BLOCK_SIZE,
+} from './tailEstimation';
+import { captureTail } from './tailProcessor';
 
 /**
  * Preview Web Worker
@@ -32,14 +39,6 @@ type WorkerMessage = WorkerRenderRequest | WorkerCancelRequest;
 
 let wasmModulePromise: Promise<any> | null = null;
 let activeTaskId: string | null = null;
-
-// Tail calculation constants
-const BLOCK_SIZE = 64;
-const MAX_TAIL_SECONDS = 4.0;
-const SILENCE_THRESHOLD_RMS = 1e-4; // ~-80 dBFS
-const MIN_SILENCE_BLOCKS = Math.round((0.25 * 48000) / BLOCK_SIZE); // ~188 blocks (250 ms)
-const MIN_TAIL_CHECK_BLOCKS = Math.round((0.4 * 48000) / BLOCK_SIZE); // ~300 blocks (allow delays to arrive)
-const MAX_TAIL_BLOCKS = Math.round((MAX_TAIL_SECONDS * 48000) / BLOCK_SIZE); // 3000 blocks
 
 async function getWasmModule(): Promise<any> {
   if (!wasmModulePromise) {
@@ -161,59 +160,34 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 
       mod.HEAPF32.fill(0, zeroInPtr >> 2, (zeroInPtr >> 2) + BLOCK_SIZE);
 
-      const tailChunksL: Float32Array[] = [];
-      const tailChunksR: Float32Array[] = [];
-      let consecutiveSilence = 0;
+      const maxTailSeconds = estimateMaxTailSeconds(parameters);
+      const minTailCheckSeconds = estimateMinTailCheckSeconds(parameters);
+      const minSilenceSeconds = estimateMinSilenceSeconds(parameters);
 
-      for (let b = 0; b < MAX_TAIL_BLOCKS; b++) {
-        if (activeTaskId !== taskId) {
-          return;
-        }
+      const capturedTail = captureTail({
+        maxTailSeconds,
+        minTailCheckSeconds,
+        minSilenceSeconds,
+        shouldAbort: () => activeTaskId !== taskId,
+        step: (blockL, blockR, count) => {
+          const okBlock = render(zeroInPtr, count, tailLPtr, tailRPtr);
+          if (!okBlock) return false;
+          blockL.set(mod.HEAPF32.subarray(tailLPtr >> 2, (tailLPtr >> 2) + count));
+          blockR.set(mod.HEAPF32.subarray(tailRPtr >> 2, (tailRPtr >> 2) + count));
+          return true;
+        },
+      });
 
-        const okBlock = render(zeroInPtr, BLOCK_SIZE, tailLPtr, tailRPtr);
-        if (!okBlock) {
-          break;
-        }
-
-        const bL = new Float32Array(BLOCK_SIZE);
-        const bR = new Float32Array(BLOCK_SIZE);
-        bL.set(mod.HEAPF32.subarray(tailLPtr >> 2, (tailLPtr >> 2) + BLOCK_SIZE));
-        bR.set(mod.HEAPF32.subarray(tailRPtr >> 2, (tailRPtr >> 2) + BLOCK_SIZE));
-
-        // Monitor RMS energy of this block
-        let sumSq = 0;
-        for (let i = 0; i < BLOCK_SIZE; i++) {
-          sumSq += bL[i] * bL[i] + bR[i] * bR[i];
-        }
-        const rms = Math.sqrt(sumSq / (BLOCK_SIZE * 2));
-
-        tailChunksL.push(bL);
-        tailChunksR.push(bR);
-
-        if (rms < SILENCE_THRESHOLD_RMS) {
-          consecutiveSilence++;
-        } else {
-          consecutiveSilence = 0;
-        }
-
-        // Early termination once silence persists after minimum check period
-        if (b >= MIN_TAIL_CHECK_BLOCKS && consecutiveSilence >= MIN_SILENCE_BLOCKS) {
-          break;
-        }
-      }
-
-      // Check if task was superseded during tail render
-      if (activeTaskId !== taskId) {
+      // Aborted while rendering the tail: discard without posting.
+      if (capturedTail === null) {
         return;
       }
 
       const renderTimeMs = performance.now() - t0;
 
       // 8. Assemble combined output audio (Source + Tail)
-      const trimBlocks = Math.max(0, consecutiveSilence - 4);
-      const finalTailBlocks = Math.max(0, tailChunksL.length - trimBlocks);
-      const tailFrames = finalTailBlocks * BLOCK_SIZE;
-      const tailDurationSeconds = tailFrames / 48000;
+      const tailFrames = capturedTail.left.length;
+      const tailDurationSeconds = capturedTail.tailDurationSeconds;
 
       const totalFrames = frames + tailFrames;
       const outL = new Float32Array(totalFrames);
@@ -221,11 +195,8 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
 
       outL.set(sourceL, 0);
       outR.set(sourceR, 0);
-
-      for (let i = 0; i < finalTailBlocks; i++) {
-        outL.set(tailChunksL[i], frames + i * BLOCK_SIZE);
-        outR.set(tailChunksR[i], frames + i * BLOCK_SIZE);
-      }
+      outL.set(capturedTail.left, frames);
+      outR.set(capturedTail.right, frames);
 
       // 9. Post back result with Transferable buffers
       (self as any).postMessage(

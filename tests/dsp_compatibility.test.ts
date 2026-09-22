@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import crypto from 'crypto';
 import compatibilityManifest from '../src/audio/wasm/dsp-compatibility.json';
 import parameterContract from '../contracts/voxp4-parameters-v1.json';
 import { catalog } from '../src/domain/catalog';
@@ -50,5 +53,22 @@ describe('DSP Compatibility & Contract Parity', () => {
     const contractString = JSON.stringify(parameterContract);
     expect(contractString.includes('wireId')).toBe(false);
     expect(contractString.includes('wire_id')).toBe(false);
+  });
+
+  it('proves manifest.wasmSha256 matches the committed WASM binary byte-for-byte', () => {
+    const wasmPath = path.resolve(__dirname, '../src/audio/wasm/voxp4-preview.wasm');
+    const actual = crypto.createHash('sha256').update(fs.readFileSync(wasmPath)).digest('hex');
+    expect(actual).toBe(compatibilityManifest.wasmSha256);
+  });
+
+  it('proves manifest.contractSha256 matches the committed parameter contract', () => {
+    const contractPath = path.resolve(__dirname, '../contracts/voxp4-parameters-v1.json');
+    const actual = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
+    expect(actual).toBe(compatibilityManifest.contractSha256);
+  });
+
+  it('records a real DSP commit provenance rather than a placeholder', () => {
+    expect(compatibilityManifest.dspCommit).toMatch(/^[0-9a-f]{40}$/);
+    expect(compatibilityManifest.dspCommit).not.toBe('unknown');
   });
 });
