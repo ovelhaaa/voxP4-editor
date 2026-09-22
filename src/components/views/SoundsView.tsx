@@ -3,7 +3,8 @@ import { useEditor } from '../../state/editorState';
 import { Preset } from '../../domain/models';
 import { FxRack } from '../rack/FxRack';
 import { EFFECT_MODULES } from '../../domain/effectModules';
-import { resolveParameterState } from '../../domain/resolution';
+import { resolveParameterState, resolveAllParameters } from '../../domain/resolution';
+import { AuditionButton } from '../preview/AuditionButton';
 import { Sliders, Plus, Copy, Trash2, MoreVertical } from 'lucide-react';
 
 interface SoundsViewProps {
@@ -116,19 +117,25 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                   </div>
                 </div>
 
-                {/* Touch-friendly overflow menu (...) */}
-                <div className="relative shrink-0 ml-1">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setActiveMenuId(activeMenuId === preset.id ? null : preset.id);
-                    }}
-                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
-                    title="Sound options"
-                  >
-                    <MoreVertical className="w-3.5 h-3.5" />
-                  </button>
+                {/* Audition button and overflow menu */}
+                <div className="flex items-center gap-0.5 shrink-0 ml-1">
+                  <AuditionButton
+                    label={`Preset: ${preset.name}`}
+                    resolvedParams={() => resolveAllParameters({ preset, currentLevel: 'preset' })}
+                  />
+
+                  <div className="relative shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveMenuId(activeMenuId === preset.id ? null : preset.id);
+                      }}
+                      className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
+                      title="Sound options"
+                    >
+                      <MoreVertical className="w-3.5 h-3.5" />
+                    </button>
 
                   {activeMenuId === preset.id && (
                     <div
@@ -161,6 +168,7 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
                       )}
                     </div>
                   )}
+                  </div>
                 </div>
               </div>
             );
@@ -191,6 +199,12 @@ export const SoundsView: React.FC<SoundsViewProps> = ({ onOpenAdvanced }) => {
           </div>
 
           <div className="flex items-center gap-2">
+            <AuditionButton
+              label={`Preset: ${currentPreset.name}`}
+              resolvedParams={() => resolveAllParameters({ preset: currentPreset, currentLevel: 'preset' })}
+              className="h-8 px-2.5 bg-[#101116] hover:bg-[#1C1D24] text-[#B1ACA3] hover:text-[#F45126] border border-[#292A30] text-xs font-mono"
+              title="Audition current preset"
+            />
             <button
               type="button"
               onClick={() => dispatch({ type: 'DUPLICATE_PRESET', presetId: currentPreset.id })}

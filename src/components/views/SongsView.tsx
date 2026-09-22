@@ -3,6 +3,8 @@ import { useEditor } from '../../state/editorState';
 import { Scene } from '../../domain/models';
 import { catalog } from '../../domain/catalog';
 import { resolveSongMusicalAttributes } from '../../domain/musicalResolution';
+import { resolveAllParameters } from '../../domain/resolution';
+import { AuditionButton } from '../preview/AuditionButton';
 import { FxRack } from '../rack/FxRack';
 import {
   Plus,
@@ -189,19 +191,27 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                   </div>
                 </div>
 
-                {/* Touch friendly Song actions menu (...) */}
-                <div className="relative shrink-0 ml-1">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setActiveSongMenu(activeSongMenu === scene.id ? null : scene.id);
-                    }}
-                    className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
-                    title="Song options"
-                  >
-                    <MoreVertical className="w-3.5 h-3.5" />
-                  </button>
+                {/* Audition button and touch friendly Song actions menu */}
+                <div className="flex items-center gap-0.5 shrink-0 ml-1">
+                  <AuditionButton
+                    label={`Song: ${scene.name}`}
+                    resolvedParams={() =>
+                      resolveAllParameters({ preset: scenePreset, scene, currentLevel: 'scene' })
+                    }
+                  />
+
+                  <div className="relative shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveSongMenu(activeSongMenu === scene.id ? null : scene.id);
+                      }}
+                      className="p-1 text-[#716E69] hover:text-[#F0EDE5] rounded opacity-60 hover:opacity-100 transition cursor-pointer"
+                      title="Song options"
+                    >
+                      <MoreVertical className="w-3.5 h-3.5" />
+                    </button>
 
                   {activeSongMenu === scene.id && (
                     <div
@@ -236,8 +246,9 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
                   )}
                 </div>
               </div>
-            );
-          })}
+            </div>
+          );
+        })}
         </div>
       </aside>
 
@@ -316,34 +327,45 @@ export const SongsView: React.FC<SongsViewProps> = ({ onOpenAdvanced }) => {
               )}
             </div>
 
-            {/* Sound (Base Preset) Selector */}
-            <div className="flex items-center gap-2 bg-[#101116] border border-[#292A30] px-3 py-1.5 rounded-[4px] shrink-0 self-start">
-              <Sliders className="w-4 h-4 text-[#F45126]" />
-              <div className="text-xs">
-                <span className="text-[#716E69] mr-1.5">Sound:</span>
-                <select
-                  value={currentScene.basePresetId || ''}
-                  onChange={(e) =>
-                    dispatch({
-                      type: 'UPDATE_SCENE',
-                      scene: {
-                        ...currentScene,
-                        basePresetId: e.target.value || undefined,
-                      },
-                    })
-                  }
-                  className="bg-transparent text-[#F0EDE5] font-semibold text-xs focus:outline-none cursor-pointer"
-                >
-                  <option value="" className="bg-[#14151B]">
-                    -- Default Sound --
-                  </option>
-                  {presets.map((p) => (
-                    <option key={p.id} value={p.id} className="bg-[#14151B]">
-                      {p.name}
+            {/* Sound (Base Preset) Selector & Song Audition */}
+            <div className="flex items-center gap-2 shrink-0 self-start">
+              <div className="flex items-center gap-2 bg-[#101116] border border-[#292A30] px-3 py-1.5 rounded-[4px]">
+                <Sliders className="w-4 h-4 text-[#F45126]" />
+                <div className="text-xs">
+                  <span className="text-[#716E69] mr-1.5">Sound:</span>
+                  <select
+                    value={currentScene.basePresetId || ''}
+                    onChange={(e) =>
+                      dispatch({
+                        type: 'UPDATE_SCENE',
+                        scene: {
+                          ...currentScene,
+                          basePresetId: e.target.value || undefined,
+                        },
+                      })
+                    }
+                    className="bg-transparent text-[#F0EDE5] font-semibold text-xs focus:outline-none cursor-pointer"
+                  >
+                    <option value="" className="bg-[#14151B]">
+                      -- Default Sound --
                     </option>
-                  ))}
-                </select>
+                    {presets.map((p) => (
+                      <option key={p.id} value={p.id} className="bg-[#14151B]">
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
+
+              <AuditionButton
+                label={`Song: ${currentScene.name}`}
+                resolvedParams={() =>
+                  resolveAllParameters({ preset: basePreset, scene: currentScene, currentLevel: 'scene' })
+                }
+                className="h-8 px-2.5 bg-[#101116] hover:bg-[#1C1D24] text-[#B1ACA3] hover:text-[#20D6C7] border border-[#292A30] text-xs font-mono"
+                title="Audition current song"
+              />
             </div>
           </div>
 

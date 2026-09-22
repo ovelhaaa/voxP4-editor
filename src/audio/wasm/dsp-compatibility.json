@@ -1,0 +1,9 @@
+{
+  "engine": "voxP4",
+  "dspCommit": "e25136226b76e2a349de0ae8b2bc518cf9477c8b",
+  "contractVersion": 1,
+  "parameterCount": 71,
+  "sampleRate": 48000,
+  "blockSize": 64,
+  "profile": "P4Production"
+}

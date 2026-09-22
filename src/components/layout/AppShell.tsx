@@ -10,6 +10,8 @@ import { AdvancedParameterDrawer } from '../inspector/AdvancedParameterDrawer';
 import { ValidationModal } from '../modals/ValidationModal';
 import { ImportErrorModal } from '../modals/ImportErrorModal';
 
+import { VocalPreviewPanel } from '../preview/VocalPreviewPanel';
+
 export const AppShell: React.FC = () => {
   const { state, dispatch } = useEditor();
   const { selection, library } = state;
@@ -92,16 +94,23 @@ export const AppShell: React.FC = () => {
         />
 
         {/* Active View Container */}
-        <div className="flex-1 flex overflow-hidden bg-[#090A0E]">
-          {activeSection === 'songs' && (
-            <SongsView onOpenAdvanced={() => setIsAdvancedOpen(true)} />
-          )}
-          {activeSection === 'sounds' && (
-            <SoundsView onOpenAdvanced={() => setIsAdvancedOpen(true)} />
-          )}
-          {activeSection === 'setlists' && <SetlistsView />}
-          {activeSection === 'library' && (
-            <LibraryView onImportError={(errors) => setImportErrors(errors)} />
+        <div className="flex-1 flex flex-col overflow-hidden bg-[#090A0E]">
+          <div className="flex-1 flex overflow-hidden">
+            {activeSection === 'songs' && (
+              <SongsView onOpenAdvanced={() => setIsAdvancedOpen(true)} />
+            )}
+            {activeSection === 'sounds' && (
+              <SoundsView onOpenAdvanced={() => setIsAdvancedOpen(true)} />
+            )}
+            {activeSection === 'setlists' && <SetlistsView />}
+            {activeSection === 'library' && (
+              <LibraryView onImportError={(errors) => setImportErrors(errors)} />
+            )}
+          </div>
+
+          {/* Persistent Vocal Preview Panel (Active in Songs and Sounds views) */}
+          {(activeSection === 'songs' || activeSection === 'sounds') && (
+            <VocalPreviewPanel />
           )}
         </div>
       </div>
