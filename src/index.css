@@ -1,29 +1,60 @@
 @import "tailwindcss";
 
+@theme {
+  --color-vox-bg: #090A0E;
+  --color-vox-surface: #14151B;
+  --color-vox-elevated: #1C1D24;
+  --color-vox-header: #101116;
+  --color-vox-panel: #202128;
+  --color-vox-border: #34343C;
+  --color-vox-separator: #292A30;
+  --color-vox-text-primary: #F0EDE5;
+  --color-vox-text-secondary: #B1ACA3;
+  --color-vox-text-muted: #716E69;
+  --color-vox-text-faint: #4A4947;
+  --color-vox-accent: #F45126;
+  --color-vox-accent-bright: #FF6030;
+  --color-vox-accent-dark: #B83A1C;
+  --color-vox-audio: #20D6C7;
+  --color-vox-audio-bright: #55EFE2;
+  --color-vox-audio-dark: #148E87;
+  --color-vox-warning: #E6A63A;
+  --color-vox-error: #E65050;
+  --color-vox-disabled: #414147;
+}
+
 @layer base {
   body {
-    @apply bg-slate-950 text-slate-100 antialiased selection:bg-amber-500 selection:text-black;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: #090A0E;
+    color: #F0EDE5;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  
+  ::selection {
+    background-color: #F45126;
+    color: #090A0E;
   }
 }
 
-/* Custom minimal scrollbar */
+/* Hardware style restrained scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
+  background: #101116;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(71, 85, 105, 0.5);
+  background: #34343C;
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.8);
+  background: #716E69;
 }
 
 .no-scrollbar::-webkit-scrollbar {

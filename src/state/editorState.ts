@@ -123,9 +123,11 @@ export function createEmptyLibrary(name = 'New Live Rig'): VoxP4Library {
 export function createInitialState(initialLib?: VoxP4Library): EditorState {
   const lib = initialLib ?? canonicalDemoLibrary;
   const serialized = serializeLibrary(lib);
-  const initialSelection: SelectionState = lib.presets[0]
-    ? { type: 'preset', id: lib.presets[0].id }
-    : { type: 'library', id: lib.libraryId };
+  const initialSelection: SelectionState = lib.scenes[0]
+    ? { type: 'scene', id: lib.scenes[0].id }
+    : lib.presets[0]
+      ? { type: 'preset', id: lib.presets[0].id }
+      : { type: 'library', id: lib.libraryId };
 
   return {
     library: lib,
@@ -166,10 +168,13 @@ export function editorReducer(state: EditorState, action: Action): EditorState {
     case 'LOAD_LIBRARY': {
       const serialized = serializeLibrary(action.library);
       const validation = validateLibrary(action.library);
+      const firstScene = action.library.scenes[0];
       const firstPreset = action.library.presets[0];
-      const newSelection: SelectionState = firstPreset
-        ? { type: 'preset', id: firstPreset.id }
-        : { type: 'library', id: action.library.libraryId };
+      const newSelection: SelectionState = firstScene
+        ? { type: 'scene', id: firstScene.id }
+        : firstPreset
+          ? { type: 'preset', id: firstPreset.id }
+          : { type: 'library', id: action.library.libraryId };
 
       if (action.markClean) {
         saveDraft(action.library);
