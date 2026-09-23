@@ -1,7 +1,7 @@
 {
   "engine": "voxP4",
-  "dspCommit": "e4a616590643ec1b04acca9c79f659eb33c4ee2a",
-  "wasmSha256": "10d13ad5db4d9c4b27c3190d1e26c7a3d8a97ea3e7d557f5b0b01ad8c2750744",
+  "dspCommit": "e551ed94e5456c6af54b5867e8286989975b0eda",
+  "wasmSha256": "65b890b2160307758fc23f1d45694ac5140e16dc1789aa59b0a7765f57da5d26",
   "contractVersion": 1,
   "contractSha256": "fbbf398fbf345356ea790cbb5a133d15740616cf13f1fcc5d7cbcafd6b077623",
   "parameterCount": 71,

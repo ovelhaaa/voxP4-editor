@@ -7,6 +7,8 @@ import {
   tempoSubdivisionMs,
   clampTempoBpm,
   tempoSubdivisionRatio,
+  clampSubdivisionIndex,
+  TEMPO_SUBDIVISION_COUNT,
   SUBDIVISION_INDEX,
   MIN_TAIL_SECONDS,
   MAX_ALLOWED_TAIL_SECONDS,
@@ -161,11 +163,33 @@ describe('Delay BPM sync effective times', () => {
     expect(t.rightMs).toBeCloseTo(2000, 6);
   });
 
-  it('falls back to a quarter note for invalid subdivision indices (matches DSP default)', () => {
+  it('tempo helper: invalid enum values fall back to a quarter note (tempo_subdivision_ratio default branch)', () => {
+    // This describes the raw C++ helper only, NOT the real parameter path.
     expect(tempoSubdivisionRatio(-1)).toBeCloseTo(1.0, 6);
     expect(tempoSubdivisionRatio(13)).toBeCloseTo(1.0, 6);
     expect(tempoSubdivisionRatio(255)).toBeCloseTo(1.0, 6);
     expect(tempoSubdivisionRatio(Number.NaN)).toBeCloseTo(1.0, 6);
+  });
+
+  it('parameter path: clamps the subdivision index to [0, Count-1] before enum conversion', () => {
+    // Mirrors vocal_fx.cpp: static_cast<TempoSubdivision>(clamp(round(v), 0, Count-1)).
+    expect(clampSubdivisionIndex(-1)).toBe(0); // Whole, NOT Quarter
+    expect(clampSubdivisionIndex(0)).toBe(0);
+    expect(clampSubdivisionIndex(12)).toBe(TEMPO_SUBDIVISION_COUNT - 1);
+    expect(clampSubdivisionIndex(13)).toBe(TEMPO_SUBDIVISION_COUNT - 1);
+    expect(clampSubdivisionIndex(200)).toBe(TEMPO_SUBDIVISION_COUNT - 1);
+  });
+
+  it('resolveEffectiveDelayTimes uses the parameter-path clamp, not the helper fallback', () => {
+    const params = baseParams({
+      'delay.sync_enable': 1,
+      'tempo.bpm': 120,
+      'delay.left_subdivision': -1, // -> Whole (4 quarter notes) = 2000 ms
+      'delay.right_subdivision': 13, // -> TripletSixteenth (1/6) ~= 83.3 ms
+    });
+    const t = resolveEffectiveDelayTimes(params);
+    expect(t.leftMs).toBeCloseTo(2000, 3);
+    expect(t.rightMs).toBeCloseTo(60000 / 120 / 6, 3);
   });
 
   it('clamps BPM like the DSP', () => {

@@ -135,7 +135,7 @@ Builds the strictly typed, optimized single-page application into `dist/`.
 ```bash
 npm test
 ```
-Executes all 18 test suites (116 unit and integration tests) using Vitest.
+Executes all 19 test suites (124 unit and integration tests) using Vitest.
 
 ### Update Contracts
 ```bash
@@ -162,9 +162,15 @@ editor. To sync an already-built package manually:
 npm run sync-wasm -- <package-dir>
 ```
 The package directory must contain `voxp4-preview.mjs`, `voxp4-preview.wasm`, and
-`dsp-compatibility.json`. All files are validated (hashes, profile, contract
-version, parameter count, sample rate, block size) before any artifact is
-replaced, so a partial or mismatched update is impossible.
+`dsp-compatibility.json`. The sync is transactional (all-or-nothing): the package
+is validated, copied to a staging directory, re-validated, and only then swapped
+into place with a backup. If the final swap fails, the previous complete package
+is restored, so a partial or mismatched update is impossible. Validation covers
+hashes, profile, contract version, parameter count, sample rate, and block size.
+
+Official editor artifacts must come from a **clean** `voxP4` worktree; the
+generator refuses to emit a manifest from a dirty tree or when the commit
+embedded in the WASM does not match `git HEAD`.
 
 ---
 

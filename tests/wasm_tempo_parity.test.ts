@@ -31,7 +31,10 @@ describe('Tempo subdivision JS/C++ parity (real WASM)', () => {
     });
   }
 
-  it('matches the DSP for invalid subdivision indices (quarter-note fallback)', () => {
+  it('tempo helper: invalid enum fallback matches the C++ tempo_subdivision_ratio default branch', () => {
+    // The raw helper falls back to Quarter for out-of-range enum values. The
+    // real parameter path instead clamps the index first (covered in
+    // tail_estimation.test.ts via clampSubdivisionIndex).
     for (const index of [-1, 13, 200]) {
       const expected = wasmSubdivisionMs(120, index);
       const actual = tempoSubdivisionMs(120, index);

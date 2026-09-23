@@ -77,6 +77,9 @@ export const TEMPO_SUBDIVISION_RATIOS = [
   1.0 / 6.0,
 ] as const;
 
+/** Number of canonical subdivisions (TempoSubdivision::Count in the DSP). */
+export const TEMPO_SUBDIVISION_COUNT = TEMPO_SUBDIVISION_NAMES.length;
+
 /** Name -> canonical index map for readability in tests and callers. */
 export const SUBDIVISION_INDEX: Readonly<Record<string, number>> = TEMPO_SUBDIVISION_NAMES.reduce(
   (acc, name, index) => {
@@ -114,8 +117,12 @@ export function clampTempoBpm(bpm: number): number {
 }
 
 /**
- * Ratio for a subdivision index. Invalid indices fall back to Quarter (1.0),
- * matching the default branch of tempo_subdivision_ratio() in the DSP.
+ * Ratio for a subdivision index.
+ *
+ * This mirrors the raw DSP helper `tempo_subdivision_ratio()`: an invalid enum
+ * value falls back to Quarter (1.0) via its default branch. Note this is NOT the
+ * behavior of the real parameter path, which clamps the index before converting
+ * to the enum (see `clampSubdivisionIndex`).
  */
 export function tempoSubdivisionRatio(subdivision: number): number {
   if (!Number.isFinite(subdivision)) return 1.0;
@@ -126,10 +133,24 @@ export function tempoSubdivisionRatio(subdivision: number): number {
 
 /**
  * Duration in milliseconds of a subdivision at the given BPM.
- * Mirrors tempo_subdivision_ms() in voxP4.
+ * Mirrors the raw DSP helper `tempo_subdivision_ms()` (invalid enum -> Quarter).
  */
 export function tempoSubdivisionMs(bpm: number, subdivision: number): number {
   return (60000 / clampTempoBpm(bpm)) * tempoSubdivisionRatio(subdivision);
+}
+
+/**
+ * Clamps a subdivision value exactly like the real parameter path in
+ * vocal_fx.cpp (DelayLeftSubdivision / DelayRightSubdivision):
+ *
+ *   static_cast<TempoSubdivision>(clamp((int)round(v), 0, Count - 1))
+ *
+ * So -1 becomes Whole (not Quarter) and 13 becomes TripletSixteenth. This is the
+ * behavior that applies when the editor sends resolved parameter values.
+ */
+export function clampSubdivisionIndex(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(Math.max(Math.round(value), 0), TEMPO_SUBDIVISION_COUNT - 1);
 }
 
 export interface EffectiveDelayTimes {
@@ -158,8 +179,16 @@ export function resolveEffectiveDelayTimes(parameters: Record<string, number>): 
 
   if (isEnabled(parameters, 'delay.sync_enable')) {
     const bpm = readNumber(parameters, 'tempo.bpm', DEFAULT_TEMPO_BPM);
-    leftMs = tempoSubdivisionMs(bpm, readNumber(parameters, 'delay.left_subdivision', 0));
-    rightMs = tempoSubdivisionMs(bpm, readNumber(parameters, 'delay.right_subdivision', 0));
+    // Mirror the real parameter path: clamp the incoming value to a valid enum
+    // index before converting it (contract defaults: Eighth / DottedEighth).
+    const leftIndex = clampSubdivisionIndex(
+      readNumber(parameters, 'delay.left_subdivision', SUBDIVISION_INDEX.Eighth)
+    );
+    const rightIndex = clampSubdivisionIndex(
+      readNumber(parameters, 'delay.right_subdivision', SUBDIVISION_INDEX.DottedEighth)
+    );
+    leftMs = tempoSubdivisionMs(bpm, leftIndex);
+    rightMs = tempoSubdivisionMs(bpm, rightIndex);
   } else {
     leftMs = readNumber(parameters, 'delay.left_ms', 0);
     rightMs = readNumber(parameters, 'delay.right_ms', 0);

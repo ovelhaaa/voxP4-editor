@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Atomically updates the committed WASM preview package in
+ * Transactionally updates the committed WASM preview package in
  * src/audio/wasm/ from an external package directory.
  *
  * Usage:
@@ -11,22 +11,25 @@
  *   voxp4-preview.wasm
  *   dsp-compatibility.json
  *
- * The package is fully validated BEFORE any file is replaced. There is no
- * partial update: if any check fails, the current editor artifacts are untouched.
+ * The update is all-or-nothing: the destination ends up either as the complete
+ * old package or the complete new package, never a mix. The sequence is:
+ *
+ *   1. validate the incoming package;
+ *   2. copy it into a sibling staging directory;
+ *   3. validate the staging copy again;
+ *   4. move the current package to a backup directory;
+ *   5. swap the staging directory into place;
+ *   6. delete the backup (only after a successful swap).
+ *
+ * If step 4 or 5 fails, the backup is restored before returning an error.
  */
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, '..');
-
-const DEST_DIR = path.join(repoRoot, 'src', 'audio', 'wasm');
-const CONTRACT_PATH = path.join(repoRoot, 'contracts', 'voxp4-parameters-v1.json');
-
-const REQUIRED_FILES = ['voxp4-preview.mjs', 'voxp4-preview.wasm', 'dsp-compatibility.json'];
-const EXPECTED = {
+export const REQUIRED_FILES = ['voxp4-preview.mjs', 'voxp4-preview.wasm', 'dsp-compatibility.json'];
+export const EXPECTED = {
   engine: 'voxP4',
   profile: 'P4Production',
   contractVersion: 1,
@@ -35,92 +38,182 @@ const EXPECTED = {
   blockSize: 64,
 };
 
-function die(message) {
-  console.error(`[sync-wasm] ERROR - ${message}`);
-  process.exit(1);
+function sha256(filePath, fsImpl) {
+  return crypto.createHash('sha256').update(fsImpl.readFileSync(filePath)).digest('hex');
 }
 
-function sha256(filePath) {
-  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+/**
+ * Validates a package directory. Throws an Error on any inconsistency.
+ * Returns the parsed manifest on success.
+ */
+export function validatePackage(inputDir, contractPath, fsImpl = fs) {
+  if (!fsImpl.existsSync(inputDir) || !fsImpl.statSync(inputDir).isDirectory()) {
+    throw new Error(`package directory not found: ${inputDir}`);
+  }
+
+  for (const file of REQUIRED_FILES) {
+    if (!fsImpl.existsSync(path.join(inputDir, file))) {
+      throw new Error(`required package file missing: ${file}`);
+    }
+  }
+
+  const manifest = JSON.parse(fsImpl.readFileSync(path.join(inputDir, 'dsp-compatibility.json'), 'utf8'));
+
+  for (const [key, expected] of Object.entries(EXPECTED)) {
+    if (manifest[key] !== expected) {
+      throw new Error(
+        `manifest.${key} is ${JSON.stringify(manifest[key])}, expected ${JSON.stringify(expected)}`
+      );
+    }
+  }
+
+  const actualWasmSha = sha256(path.join(inputDir, 'voxp4-preview.wasm'), fsImpl);
+  if (manifest.wasmSha256 !== actualWasmSha) {
+    throw new Error(
+      `manifest.wasmSha256 does not match the package WASM.\n` +
+        `  manifest : ${manifest.wasmSha256}\n` +
+        `  actual   : ${actualWasmSha}`
+    );
+  }
+
+  if (!fsImpl.existsSync(contractPath)) {
+    throw new Error(`editor contract not found at ${contractPath}`);
+  }
+  const editorContractSha = sha256(contractPath, fsImpl);
+  if (manifest.contractSha256 !== editorContractSha) {
+    throw new Error(
+      `package manifest contractSha256 does not match the editor contract.\n` +
+        `  manifest        : ${manifest.contractSha256}\n` +
+        `  editor contract : ${editorContractSha}\n` +
+        `  The WASM package was built against a different parameter contract version.`
+    );
+  }
+
+  if (typeof manifest.dspCommit !== 'string' || manifest.dspCommit.length === 0) {
+    throw new Error('manifest.dspCommit is missing');
+  }
+
+  return manifest;
 }
 
-const inputDir = process.argv[2] ? path.resolve(process.argv[2]) : null;
-if (!inputDir) {
-  die('missing <package-dir> argument.\nUsage: node scripts/sync-wasm.mjs <package-dir>');
-}
-if (!fs.existsSync(inputDir) || !fs.statSync(inputDir).isDirectory()) {
-  die(`package directory not found: ${inputDir}`);
-}
-
-for (const file of REQUIRED_FILES) {
-  const filePath = path.join(inputDir, file);
-  if (!fs.existsSync(filePath)) {
-    die(`required package file missing: ${file}`);
+function removeDirQuietly(dir, fsImpl) {
+  try {
+    if (fsImpl.existsSync(dir)) fsImpl.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Best effort.
   }
 }
 
-const manifestPath = path.join(inputDir, 'dsp-compatibility.json');
-const wasmPath = path.join(inputDir, 'voxp4-preview.wasm');
-const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+/**
+ * Performs the transactional install. Validates everything before touching the
+ * destination and rolls back to the previous complete package on failure.
+ *
+ * @returns {{ manifest: object, updated: string[] }}
+ */
+export function runSync({ inputDir, destDir, contractPath, fsImpl = fs, log = console.log, pid = process.pid }) {
+  const manifest = validatePackage(inputDir, contractPath, fsImpl);
 
-for (const [key, expected] of Object.entries(EXPECTED)) {
-  if (manifest[key] !== expected) {
-    die(`manifest.${key} is ${JSON.stringify(manifest[key])}, expected ${JSON.stringify(expected)}`);
+  const parentDir = path.dirname(destDir);
+  fsImpl.mkdirSync(parentDir, { recursive: true });
+
+  const stagingDir = path.join(parentDir, `.wasm-staging-${pid}`);
+  const backupDir = path.join(parentDir, `.wasm-backup-${pid}`);
+
+  // Clear any leftovers from a previous interrupted run.
+  removeDirQuietly(stagingDir, fsImpl);
+  removeDirQuietly(backupDir, fsImpl);
+
+  let backupCreated = false;
+
+  try {
+    // 2. Copy the whole package into staging.
+    fsImpl.mkdirSync(stagingDir, { recursive: true });
+    for (const file of REQUIRED_FILES) {
+      fsImpl.copyFileSync(path.join(inputDir, file), path.join(stagingDir, file));
+    }
+
+    // 3. Re-validate the staging copy.
+    validatePackage(stagingDir, contractPath, fsImpl);
+
+    // 4. Move the current package out of the way.
+    const destExists = fsImpl.existsSync(destDir);
+    if (destExists) {
+      fsImpl.renameSync(destDir, backupDir);
+      backupCreated = true;
+    }
+
+    // 5. Swap the validated staging package into place.
+    try {
+      fsImpl.renameSync(stagingDir, destDir);
+    } catch (swapError) {
+      if (backupCreated && !fsImpl.existsSync(destDir)) {
+        try {
+          fsImpl.renameSync(backupDir, destDir);
+          backupCreated = false;
+        } catch (rollbackError) {
+          throw new Error(
+            `swap failed (${swapError.message}) and rollback failed (${rollbackError.message}). ` +
+              `The previous package is preserved at ${backupDir}.`
+          );
+        }
+      }
+      throw swapError;
+    }
+  } catch (err) {
+    removeDirQuietly(stagingDir, fsImpl);
+    // If we moved the destination aside but did not complete the swap, restore it.
+    if (backupCreated && !fsImpl.existsSync(destDir) && fsImpl.existsSync(backupDir)) {
+      fsImpl.renameSync(backupDir, destDir);
+      backupCreated = false;
+    }
+    throw err;
+  }
+
+  // 6. Success: drop the backup.
+  if (backupCreated) {
+    try {
+      fsImpl.rmSync(backupDir, { recursive: true, force: true });
+    } catch (err) {
+      log(`[sync-wasm] WARNING: could not remove backup ${backupDir}: ${err.message}`);
+    }
+  }
+
+  return {
+    manifest,
+    updated: REQUIRED_FILES.map((file) => path.join(destDir, file)),
+  };
+}
+
+function main() {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.resolve(__dirname, '..');
+  const destDir = path.join(repoRoot, 'src', 'audio', 'wasm');
+  const contractPath = path.join(repoRoot, 'contracts', 'voxp4-parameters-v1.json');
+
+  const inputArg = process.argv[2];
+  if (!inputArg) {
+    console.error('[sync-wasm] ERROR - missing <package-dir> argument.');
+    console.error('Usage: node scripts/sync-wasm.mjs <package-dir>');
+    process.exit(1);
+  }
+
+  try {
+    const { manifest, updated } = runSync({
+      inputDir: path.resolve(inputArg),
+      destDir,
+      contractPath,
+    });
+    console.log('[sync-wasm] OK');
+    for (const file of updated) console.log(`  updated ${path.relative(repoRoot, file)}`);
+    console.log(`  dspCommit = ${manifest.dspCommit}`);
+  } catch (err) {
+    console.error(`[sync-wasm] ERROR - ${err.message}`);
+    process.exit(1);
   }
 }
 
-const actualWasmSha = sha256(wasmPath);
-if (manifest.wasmSha256 !== actualWasmSha) {
-  die(
-    `manifest.wasmSha256 does not match the package WASM.\n` +
-      `  manifest : ${manifest.wasmSha256}\n` +
-      `  actual   : ${actualWasmSha}`
-  );
+const invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  main();
 }
-
-if (!fs.existsSync(CONTRACT_PATH)) {
-  die(`editor contract not found at ${CONTRACT_PATH}`);
-}
-const editorContractSha = sha256(CONTRACT_PATH);
-if (manifest.contractSha256 !== editorContractSha) {
-  die(
-    `package manifest contractSha256 does not match the editor contract.\n` +
-      `  manifest        : ${manifest.contractSha256}\n` +
-      `  editor contract : ${editorContractSha}\n` +
-      `  The WASM package was built against a different parameter contract version.`
-  );
-}
-
-if (typeof manifest.dspCommit !== 'string' || manifest.dspCommit.length === 0) {
-  die('manifest.dspCommit is missing');
-}
-
-// ---- All validation passed: stage then atomically swap. ----
-if (!fs.existsSync(DEST_DIR)) {
-  fs.mkdirSync(DEST_DIR, { recursive: true });
-}
-
-const staged = [];
-for (const file of REQUIRED_FILES) {
-  const src = path.join(inputDir, file);
-  const staging = path.join(DEST_DIR, `.${file}.staging-${process.pid}`);
-  fs.copyFileSync(src, staging);
-  staged.push({ file, staging, final: path.join(DEST_DIR, file) });
-}
-
-try {
-  for (const { staging, final } of staged) {
-    fs.renameSync(staging, final);
-  }
-} catch (err) {
-  for (const { staging } of staged) {
-    if (fs.existsSync(staging)) fs.unlinkSync(staging);
-  }
-  die(`failed while committing files: ${err.message}`);
-}
-
-console.log('[sync-wasm] OK');
-for (const file of REQUIRED_FILES) {
-  console.log(`  updated ${path.relative(repoRoot, path.join(DEST_DIR, file))}`);
-}
-console.log(`  dspCommit = ${manifest.dspCommit}`);
