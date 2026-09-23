@@ -12,6 +12,26 @@ export type AuditionMode = 'processed' | 'dry';
 
 export type ContextType = 'preset' | 'scene' | 'subscene';
 
+/**
+ * Quick audition length presets. These only bound the rendered *source* region;
+ * the DSP tail (reverb/delay decay) is always preserved in full.
+ */
+export type AuditionLengthMode = 'short' | 'medium' | 'full';
+
+/** A musical region of the audition source, expressed in seconds. */
+export interface AuditionRegion {
+  readonly startSeconds: number;
+  readonly endSeconds: number;
+}
+
+/** Resolved source window (frames) actually fed to the DSP render. */
+export interface EffectiveSourceRegion {
+  readonly startFrame: number;
+  readonly frameCount: number;
+  readonly startSeconds: number;
+  readonly durationSeconds: number;
+}
+
 export interface ReferenceSample {
   readonly id: string;
   readonly filename: string;
@@ -71,4 +91,15 @@ export interface PreviewEngineStatus {
   readonly renderedFingerprint: string | null;
   readonly requestedFingerprint: string | null;
   readonly isPreviewStale: boolean;
+  readonly auditionLengthMode: AuditionLengthMode;
+  readonly auditionRegion: AuditionRegion | null;
+  readonly effectiveRegion: EffectiveSourceRegion | null;
+  readonly autoPreview: boolean;
+  readonly loudnessMatch: boolean;
+  readonly dryMonitoringGain: number;
+  readonly fxMonitoringGain: number;
+  /** True while an Auto Preview render is waiting for its debounce window. */
+  readonly isAutoPreviewPending: boolean;
+  /** True while a render is running or a debounced render is pending. */
+  readonly isUpdating: boolean;
 }

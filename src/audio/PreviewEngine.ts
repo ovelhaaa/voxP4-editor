@@ -1,6 +1,9 @@
 import {
+  AuditionLengthMode,
   AuditionMode,
+  AuditionRegion,
   ContextType,
+  EffectiveSourceRegion,
   PreviewEngineStatus,
   PreviewPlaybackState,
   ReferenceSample,
@@ -17,7 +20,14 @@ import {
 import { loadReferenceAudioSource } from './referenceSamples';
 import { ResolvedParameterState } from '../domain/resolution';
 import { mapResolvedParameters } from './parameterMapping';
+import { clampRegion, defaultAuditionRegion, resolveSourceRegion } from './auditionRegion';
+import { computeMonitoringGains } from './loudness';
 import compatibilityManifest from './wasm/dsp-compatibility.json';
+
+/** Equal-power-ish linear crossfade used when a new render/voice takes over. */
+export const DEFAULT_CROSSFADE_SECONDS = 0.05;
+/** Auto Preview debounce window (ms). */
+export const DEFAULT_AUTO_PREVIEW_DELAY_MS = 350;
 
 export class RenderSupersededError extends Error {
   constructor(message = 'Preview render was superseded by a newer render request') {
@@ -68,10 +78,22 @@ export class PreviewEngine {
   private activeContextLabel = 'No Sound Selected';
   private activeResolvedParams: readonly ResolvedParameterState[] | null = null;
   private isLooping = false;
-  private previewRegionSeconds = 20.0;
   private lastRenderTimeMs: number | null = null;
   private errorMessage: string | null = null;
   private dspIncompatible = false;
+
+  // Audition UX V2 state
+  private auditionRegion: AuditionRegion | null = null;
+  private auditionLengthMode: AuditionLengthMode = 'full';
+  private autoPreviewEnabled = false;
+  private autoPreviewDelayMs = DEFAULT_AUTO_PREVIEW_DELAY_MS;
+  private pendingAutoFingerprint: string | null = null;
+  private autoPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+  private loudnessMatchEnabled = false;
+  private dryMonitoringGain = 1;
+  private fxMonitoringGain = 1;
+  private crossfadeSeconds = DEFAULT_CROSSFADE_SECONDS;
+  private voiceGeneration = 0;
 
   private renderedAudio: RenderedAudio | null = null;
   private dryBuffer: AudioBuffer | null = null;
@@ -84,6 +106,7 @@ export class PreviewEngine {
 
   // Playback nodes
   private currentSourceNode: AudioBufferSourceNode | null = null;
+  private currentGainNode: GainNode | null = null;
   private playbackStartTime = 0;
   private playbackOffset = 0;
   private isPlaying = false;
@@ -260,7 +283,13 @@ export class PreviewEngine {
     this.playbackOffset = 0;
     this.state = 'ready';
 
+    this.auditionRegion = defaultAuditionRegion(source.duration);
+    this.cancelAutoPreviewTimer();
+    this.pendingAutoFingerprint = null;
+
     this.prepareDryBuffer();
+    this.recomputeMonitoringGains();
+    this.maybeScheduleAutoPreview();
     this.notifyListeners();
   }
 
@@ -275,22 +304,226 @@ export class PreviewEngine {
       this.activePlaybackFingerprint = null;
     }
     this.renderedAudio = audio;
+    this.recomputeMonitoringGains();
   }
 
   private prepareDryBuffer(): void {
-    if (!this.activeSource) return;
+    const region = this.getEffectiveRegion();
+    if (!this.activeSource || !region) return;
     const ctx = this.getAudioContext();
-    const frames = Math.min(
-      this.activeSource.samples.length,
-      Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
-    );
+    const frames = region.frameCount;
+    if (frames <= 0) {
+      this.dryBuffer = null;
+      return;
+    }
 
     const buf = ctx.createBuffer(2, frames, this.activeSource.sampleRate);
     // Channel data is copied by copyToChannel; no intermediate clone is required.
-    const monoSlice = this.activeSource.samples.subarray(0, frames) as Float32Array<ArrayBuffer>;
+    const monoSlice = this.activeSource.samples.subarray(
+      region.startFrame,
+      region.startFrame + frames
+    ) as Float32Array<ArrayBuffer>;
     buf.copyToChannel(monoSlice, 0);
     buf.copyToChannel(monoSlice, 1);
     this.dryBuffer = buf;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Audition Region, Quick Audition & Loudness (UX V2)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Resolves the current region + Quick Audition mode to concrete source frames.
+   * Pure and side-effect free.
+   */
+  getEffectiveRegion(): EffectiveSourceRegion | null {
+    if (!this.activeSource) return null;
+    return resolveSourceRegion({
+      region: this.auditionRegion,
+      mode: this.auditionLengthMode,
+      sampleRate: this.activeSource.sampleRate,
+      totalFrames: this.activeSource.samples.length,
+    });
+  }
+
+  getAuditionRegion(): AuditionRegion | null {
+    return this.auditionRegion;
+  }
+
+  setAuditionRegion(region: AuditionRegion): void {
+    const duration = this.activeSource?.duration ?? 0;
+    this.auditionRegion = clampRegion(region, duration);
+    this.prepareDryBuffer();
+    this.recomputeMonitoringGains();
+    this.maybeScheduleAutoPreview();
+    this.notifyListeners();
+  }
+
+  getAuditionLengthMode(): AuditionLengthMode {
+    return this.auditionLengthMode;
+  }
+
+  setAuditionLengthMode(mode: AuditionLengthMode): void {
+    if (this.auditionLengthMode === mode) return;
+    this.auditionLengthMode = mode;
+    this.prepareDryBuffer();
+    this.recomputeMonitoringGains();
+    this.maybeScheduleAutoPreview();
+
+    if (this.isPlaying) {
+      if (this.auditionMode === 'dry') {
+        this.restartActiveNode(true);
+      } else {
+        this.notifyListeners();
+      }
+    } else {
+      this.notifyListeners();
+    }
+  }
+
+  isLoudnessMatchEnabled(): boolean {
+    return this.loudnessMatchEnabled;
+  }
+
+  setLoudnessMatch(enabled: boolean): void {
+    if (this.loudnessMatchEnabled === enabled) return;
+    this.loudnessMatchEnabled = enabled;
+    this.recomputeMonitoringGains();
+
+    if (this.isPlaying) {
+      this.restartActiveNode(true);
+    } else {
+      this.notifyListeners();
+    }
+  }
+
+  private recomputeMonitoringGains(): void {
+    const region = this.getEffectiveRegion();
+    if (!this.activeSource || !region || region.frameCount <= 0) {
+      this.dryMonitoringGain = 1;
+      this.fxMonitoringGain = 1;
+      return;
+    }
+
+    const drySamples = this.activeSource.samples.subarray(
+      region.startFrame,
+      region.startFrame + region.frameCount
+    );
+
+    const rendered = this.renderedAudio;
+    const gains = computeMonitoringGains({
+      drySamples,
+      processedLeft: rendered?.left ?? drySamples,
+      processedRight: rendered?.right ?? drySamples,
+      frameCount: region.frameCount,
+      enabled: this.loudnessMatchEnabled && Boolean(rendered),
+    });
+
+    this.dryMonitoringGain = gains.dryGain;
+    this.fxMonitoringGain = gains.fxGain;
+  }
+
+  getMonitoringGain(): number {
+    return this.auditionMode === 'dry' ? this.dryMonitoringGain : this.fxMonitoringGain;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto Preview
+  // ---------------------------------------------------------------------------
+
+  isAutoPreviewEnabled(): boolean {
+    return this.autoPreviewEnabled;
+  }
+
+  setAutoPreview(enabled: boolean): void {
+    if (this.autoPreviewEnabled === enabled) return;
+    this.autoPreviewEnabled = enabled;
+    if (!enabled) {
+      this.cancelAutoPreviewTimer();
+      this.pendingAutoFingerprint = null;
+      this.notifyListeners();
+      return;
+    }
+    this.maybeScheduleAutoPreview();
+    this.notifyListeners();
+  }
+
+  setAutoPreviewDelayMs(delayMs: number): void {
+    this.autoPreviewDelayMs = Math.max(0, delayMs);
+  }
+
+  /**
+   * Schedules a debounced render when the requested DSP fingerprint differs
+   * from the last rendered/pending one. Purely cosmetic changes (label, id,
+   * waveform zoom) never reach this method because they do not alter the
+   * fingerprint.
+   */
+  private maybeScheduleAutoPreview(): void {
+    if (!this.autoPreviewEnabled) return;
+    if (!this.activeSource || !this.activeResolvedParams) return;
+
+    const fingerprint = this.computeCurrentFingerprint();
+    if (!fingerprint) return;
+
+    if (this.renderedAudio?.fingerprint === fingerprint) {
+      this.cancelAutoPreviewTimer();
+      this.pendingAutoFingerprint = null;
+      return;
+    }
+
+    // A render for exactly this fingerprint is already in flight (or queued).
+    if (this.currentTask?.contextFingerprint === fingerprint) {
+      this.cancelAutoPreviewTimer();
+      this.pendingAutoFingerprint = null;
+      return;
+    }
+
+    if (this.pendingAutoFingerprint === fingerprint && this.autoPreviewTimer !== null) {
+      return;
+    }
+
+    this.cancelAutoPreviewTimer();
+    this.pendingAutoFingerprint = fingerprint;
+    this.autoPreviewTimer = setTimeout(() => {
+      this.autoPreviewTimer = null;
+      this.runAutoPreview();
+    }, this.autoPreviewDelayMs);
+
+    this.notifyListeners();
+  }
+
+  private runAutoPreview(): void {
+    const fingerprint = this.pendingAutoFingerprint;
+    this.pendingAutoFingerprint = null;
+    if (!fingerprint) return;
+    if (!this.activeSource || !this.activeResolvedParams) return;
+
+    if (this.computeCurrentFingerprint() !== fingerprint) {
+      this.maybeScheduleAutoPreview();
+      return;
+    }
+
+    this.requestRender(
+      {
+        id: this.activeContextId,
+        type: this.activeContextType,
+        label: this.activeContextLabel,
+      },
+      this.activeResolvedParams
+    ).catch((err: any) => {
+      if (err?.name !== 'RenderSupersededError' && err?.name !== 'RenderCancelledError') {
+        console.error('Auto Preview render failed:', err);
+      }
+    }).finally(() => {
+      this.notifyListeners();
+    });
+  }
+
+  private cancelAutoPreviewTimer(): void {
+    if (this.autoPreviewTimer !== null) {
+      clearTimeout(this.autoPreviewTimer);
+      this.autoPreviewTimer = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -327,6 +560,7 @@ export class PreviewEngine {
     this.activeContextType = context.type ?? null;
     this.activeContextLabel = context.label;
     this.activeResolvedParams = resolvedParams;
+    this.maybeScheduleAutoPreview();
     this.notifyListeners();
   }
 
@@ -339,6 +573,8 @@ export class PreviewEngine {
     this.activeContextType = null;
     this.activeContextLabel = 'No Sound Selected';
     this.activeResolvedParams = null;
+    this.cancelAutoPreviewTimer();
+    this.pendingAutoFingerprint = null;
     this.notifyListeners();
   }
 
@@ -384,15 +620,22 @@ export class PreviewEngine {
       throw err;
     }
 
+    // An explicit render supersedes any queued Auto Preview.
+    this.cancelAutoPreviewTimer();
+    this.pendingAutoFingerprint = null;
+
+    const region = this.getEffectiveRegion();
+    if (!region || region.frameCount <= 0) {
+      this.notifyListeners();
+      return null;
+    }
+
     const numericParams = mapResolvedParameters(resolvedParams);
-    const frameCount = Math.min(
-      this.activeSource.samples.length,
-      Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
-    );
+    const { startFrame, frameCount } = region;
 
     const cacheKey = computeRenderCacheKey({
       sourceId: this.activeSource.id,
-      startFrame: 0,
+      startFrame,
       frameCount,
       dspBuildId: DEFAULT_DSP_BUILD_ID,
       parameters: numericParams,
@@ -400,7 +643,7 @@ export class PreviewEngine {
 
     const contextFingerprint = computePreviewFingerprint({
       sourceId: this.activeSource.id,
-      startFrame: 0,
+      startFrame,
       frameCount,
       dspBuildId: DEFAULT_DSP_BUILD_ID,
       parameters: numericParams,
@@ -416,7 +659,7 @@ export class PreviewEngine {
       this.notifyListeners();
 
       if (this.isPlaying && this.auditionMode === 'processed') {
-        this.restartActiveNode();
+        this.restartActiveNode(true);
       }
       return cached;
     }
@@ -430,7 +673,9 @@ export class PreviewEngine {
     this.notifyListeners();
 
     // Create an independent copy to transfer to worker safely without detaching activeSource.samples
-    const inputSlice = new Float32Array(this.activeSource.samples.subarray(0, frameCount));
+    const inputSlice = new Float32Array(
+      this.activeSource.samples.subarray(startFrame, startFrame + frameCount)
+    );
 
     return new Promise<RenderedAudio>((resolve, reject) => {
       const task: PreviewRenderTask = {
@@ -442,7 +687,7 @@ export class PreviewEngine {
         contextLabel,
         sourceId: this.activeSource!.id,
         frameCount,
-        startFrame: 0,
+        startFrame,
         parameters: numericParams,
         resolve,
         reject,
@@ -505,12 +750,13 @@ export class PreviewEngine {
     this.lastRenderTimeMs = renderTimeMs;
     this.state = this.isPlaying ? 'playing' : 'rendered';
     this.errorMessage = null;
+    this.pendingAutoFingerprint = null;
 
     task.resolve(rendered);
     this.notifyListeners();
 
     if (this.isPlaying && this.auditionMode === 'processed') {
-      this.restartActiveNode();
+      this.restartActiveNode(true);
     }
   }
 
@@ -532,40 +778,158 @@ export class PreviewEngine {
   // Transport & Playback
   // ---------------------------------------------------------------------------
 
+  /**
+   * Builds an equal-power fade curve. For a crossfade the outgoing voice uses
+   * `cos`, the incoming voice uses `sin`, so sin^2 + cos^2 stays constant and
+   * power does not dip for uncorrelated material.
+   */
+  private static buildFadeCurve(amplitude: number, fadeIn: boolean, steps = 33): Float32Array {
+    const curve = new Float32Array(steps);
+    for (let i = 0; i < steps; i++) {
+      const t = steps === 1 ? 1 : i / (steps - 1);
+      const shape = fadeIn ? Math.sin((t * Math.PI) / 2) : Math.cos((t * Math.PI) / 2);
+      curve[i] = amplitude * shape;
+    }
+    return curve;
+  }
+
+  /**
+   * Schedules a short equal-power fade using `setValueCurveAtTime` when
+   * available, falling back to a linear ramp. Never throws.
+   */
+  private applyFade(
+    gain: GainNode,
+    from: number,
+    to: number,
+    now: number,
+    fadeSeconds: number
+  ): boolean {
+    const param: any = gain.gain;
+    try {
+      if (typeof param.cancelScheduledValues === 'function') param.cancelScheduledValues(now);
+    } catch {}
+
+    const start = Math.max(0, from);
+    const end = Math.max(0, to);
+    const amplitude = Math.max(start, end);
+    const fadeIn = end >= start;
+
+    try {
+      if (typeof param.setValueCurveAtTime === 'function' && amplitude > 0) {
+        param.setValueCurveAtTime(
+          PreviewEngine.buildFadeCurve(amplitude, fadeIn),
+          now,
+          fadeSeconds
+        );
+        return true;
+      }
+    } catch {
+      // Fall through to a linear ramp.
+    }
+
+    try {
+      if (typeof param.linearRampToValueAtTime === 'function') {
+        if (typeof param.setValueAtTime === 'function') param.setValueAtTime(start, now);
+        param.linearRampToValueAtTime(end, now + fadeSeconds);
+        return true;
+      }
+    } catch {
+      // Fall through to a hard set.
+    }
+
+    try {
+      param.value = end;
+    } catch {}
+    return false;
+  }
+
+  /**
+   * Creates a playback voice. When the AudioContext supports GainNodes the
+   * voice fades in over `fadeSeconds` (equal-power curve) so a new render can
+   * replace the old one without clicks. Environments without createGain
+   * (tests/headless) fall back to a direct connection.
+   */
+  private createVoice(
+    buffer: AudioBuffer,
+    offset: number,
+    targetGain: number,
+    fadeSeconds: number
+  ): { node: AudioBufferSourceNode; gain: GainNode | null } {
+    const ctx = this.getAudioContext();
+    const node = ctx.createBufferSource();
+    node.buffer = buffer;
+    node.loop = this.isLooping;
+
+    const anyCtx = ctx as any;
+    const createdGain: GainNode | null =
+      typeof anyCtx.createGain === 'function' ? anyCtx.createGain() : null;
+    const gain = createdGain;
+
+    if (gain) {
+      gain.gain.value = fadeSeconds > 0 ? 0 : targetGain;
+      node.connect(gain);
+      gain.connect(ctx.destination);
+
+      if (fadeSeconds > 0) {
+        this.applyFade(gain, 0, targetGain, ctx.currentTime, fadeSeconds);
+      }
+    } else {
+      node.connect(ctx.destination);
+    }
+
+    const generation = ++this.voiceGeneration;
+    node.onended = () => {
+      if (!this.isLooping && this.isPlaying && this.voiceGeneration === generation) {
+        this.stop();
+      }
+    };
+
+    node.start(0, offset);
+    return { node, gain };
+  }
+
+  private canCrossfade(): boolean {
+    const ctx = this.getAudioContext() as any;
+    return typeof ctx.createGain === 'function';
+  }
+
+  private disconnectVoice(node: AudioBufferSourceNode | null, gain: GainNode | null): void {
+    if (node) {
+      try {
+        node.stop();
+      } catch {}
+      try {
+        node.disconnect();
+      } catch {}
+    }
+    if (gain) {
+      try {
+        gain.disconnect();
+      } catch {}
+    }
+  }
+
   play(): void {
     this.ensureAudioContextResumed();
     const buffer = this.getActiveBuffer();
     if (!buffer) return;
 
     const ctx = this.getAudioContext();
-    if (this.currentSourceNode) {
-      try {
-        this.currentSourceNode.stop();
-      } catch {}
-      this.currentSourceNode.disconnect();
-    }
-
-    const node = ctx.createBufferSource();
-    node.buffer = buffer;
-    node.loop = this.isLooping;
-    node.connect(ctx.destination);
+    this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
+    this.currentSourceNode = null;
+    this.currentGainNode = null;
 
     // Clamp offset to valid duration
     if (this.playbackOffset >= buffer.duration) {
       this.playbackOffset = 0;
     }
 
-    node.start(0, this.playbackOffset);
+    const voice = this.createVoice(buffer, this.playbackOffset, this.getMonitoringGain(), 0);
     this.playbackStartTime = ctx.currentTime - this.playbackOffset;
-    this.currentSourceNode = node;
+    this.currentSourceNode = voice.node;
+    this.currentGainNode = voice.gain;
     this.isPlaying = true;
     this.state = 'playing';
-
-    node.onended = () => {
-      if (!this.isLooping && this.isPlaying) {
-        this.stop();
-      }
-    };
 
     this.startTimeTracker();
     this.notifyListeners();
@@ -576,13 +940,9 @@ export class PreviewEngine {
     const ctx = this.getAudioContext();
     this.playbackOffset = Math.max(0, ctx.currentTime - this.playbackStartTime);
 
-    if (this.currentSourceNode) {
-      try {
-        this.currentSourceNode.stop();
-      } catch {}
-      this.currentSourceNode.disconnect();
-      this.currentSourceNode = null;
-    }
+    this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
+    this.currentSourceNode = null;
+    this.currentGainNode = null;
 
     this.isPlaying = false;
     this.state = 'paused';
@@ -591,13 +951,9 @@ export class PreviewEngine {
   }
 
   stop(): void {
-    if (this.currentSourceNode) {
-      try {
-        this.currentSourceNode.stop();
-      } catch {}
-      this.currentSourceNode.disconnect();
-      this.currentSourceNode = null;
-    }
+    this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
+    this.currentSourceNode = null;
+    this.currentGainNode = null;
 
     this.isPlaying = false;
     this.playbackOffset = 0;
@@ -613,7 +969,7 @@ export class PreviewEngine {
     this.playbackOffset = Math.max(0, Math.min(seconds, duration));
 
     if (this.isPlaying) {
-      this.restartActiveNode();
+      this.restartActiveNode(true);
     } else {
       this.notifyClockListeners(this.playbackOffset);
       this.notifyListeners();
@@ -631,7 +987,8 @@ export class PreviewEngine {
     }
 
     if (this.isPlaying) {
-      this.restartActiveNode();
+      // Dry/FX comparison must keep the same audition clock and never click.
+      this.restartActiveNode(true);
     } else {
       this.notifyListeners();
     }
@@ -645,35 +1002,45 @@ export class PreviewEngine {
     this.notifyListeners();
   }
 
-  private restartActiveNode(): void {
+  /** Crossfades (or hard-swaps) the active voice to the current buffer. */
+  private restartActiveNode(crossfade = false): void {
     const buffer = this.getActiveBuffer();
     if (!buffer) return;
 
     const ctx = this.getAudioContext();
-    const currentOffset = this.getCurrentTime();
+    const currentOffset = Math.min(Math.max(0, this.getCurrentTime()), buffer.duration);
+    const fadeSeconds = crossfade && this.canCrossfade() ? this.crossfadeSeconds : 0;
 
-    if (this.currentSourceNode) {
-      try {
-        this.currentSourceNode.stop();
-      } catch {}
-      this.currentSourceNode.disconnect();
+    const oldNode = this.currentSourceNode;
+    const oldGain = this.currentGainNode;
+
+    const voice = this.createVoice(buffer, currentOffset, this.getMonitoringGain(), fadeSeconds);
+    this.playbackStartTime = ctx.currentTime - currentOffset;
+    this.currentSourceNode = voice.node;
+    this.currentGainNode = voice.gain;
+
+    if (!oldNode) return;
+
+    if (fadeSeconds > 0 && oldGain) {
+      const now = ctx.currentTime;
+      this.applyFade(oldGain, oldGain.gain.value, 0, now, fadeSeconds);
+      const nodeToStop = oldNode;
+      const gainToStop = oldGain;
+      setTimeout(() => {
+        try {
+          nodeToStop.stop();
+        } catch {}
+        try {
+          nodeToStop.disconnect();
+        } catch {}
+        try {
+          gainToStop.disconnect();
+        } catch {}
+      }, fadeSeconds * 1000 + 30);
+      return;
     }
 
-    const node = ctx.createBufferSource();
-    node.buffer = buffer;
-    node.loop = this.isLooping;
-    node.connect(ctx.destination);
-
-    const safeOffset = Math.min(currentOffset, buffer.duration);
-    node.start(0, safeOffset);
-    this.playbackStartTime = ctx.currentTime - safeOffset;
-    this.currentSourceNode = node;
-
-    node.onended = () => {
-      if (!this.isLooping && this.isPlaying) {
-        this.stop();
-      }
-    };
+    this.disconnectVoice(oldNode, oldGain);
   }
 
   private getActiveBuffer(): AudioBuffer | null {
@@ -714,8 +1081,9 @@ export class PreviewEngine {
   }
 
   getDryDuration(): number {
-    if (!this.activeSource) return 0;
-    return Math.min(this.previewRegionSeconds, this.activeSource.duration);
+    const region = this.getEffectiveRegion();
+    if (!region) return 0;
+    return region.durationSeconds;
   }
 
   getPlaybackDuration(): number {
@@ -749,16 +1117,16 @@ export class PreviewEngine {
     if (!this.activeSource || !this.activeResolvedParams) {
       return null;
     }
+    const region = this.getEffectiveRegion();
+    if (!region || region.frameCount <= 0) {
+      return null;
+    }
     const numericParams = mapResolvedParameters(this.activeResolvedParams);
-    const frameCount = Math.min(
-      this.activeSource.samples.length,
-      Math.round(this.previewRegionSeconds * this.activeSource.sampleRate)
-    );
 
     return computePreviewFingerprint({
       sourceId: this.activeSource.id,
-      startFrame: 0,
-      frameCount,
+      startFrame: region.startFrame,
+      frameCount: region.frameCount,
       dspBuildId: DEFAULT_DSP_BUILD_ID,
       parameters: numericParams,
     });
@@ -777,6 +1145,8 @@ export class PreviewEngine {
     const currentFingerprint = this.computeCurrentFingerprint();
     const renderedFp = this.renderedAudio?.fingerprint || null;
     const isStale = Boolean(renderedFp && currentFingerprint && renderedFp !== currentFingerprint);
+    const effectiveRegion = this.getEffectiveRegion();
+    const isAutoPreviewPending = this.pendingAutoFingerprint !== null;
 
     return {
       state: this.state,
@@ -788,7 +1158,7 @@ export class PreviewEngine {
       isLooping: this.isLooping,
       currentTime: this.getCurrentTime(),
       duration: this.getPlaybackDuration(),
-      previewRegionSeconds: this.previewRegionSeconds,
+      previewRegionSeconds: effectiveRegion?.durationSeconds ?? 0,
       tailDurationSeconds: this.renderedAudio?.tailDurationSeconds || 0,
       isRendering: this.state === 'rendering',
       errorMessage: this.errorMessage,
@@ -796,6 +1166,15 @@ export class PreviewEngine {
       renderedFingerprint: renderedFp,
       requestedFingerprint: currentFingerprint,
       isPreviewStale: isStale,
+      auditionLengthMode: this.auditionLengthMode,
+      auditionRegion: this.auditionRegion,
+      effectiveRegion,
+      autoPreview: this.autoPreviewEnabled,
+      loudnessMatch: this.loudnessMatchEnabled,
+      dryMonitoringGain: this.dryMonitoringGain,
+      fxMonitoringGain: this.fxMonitoringGain,
+      isAutoPreviewPending,
+      isUpdating: this.state === 'rendering' || isAutoPreviewPending,
     };
   }
 
