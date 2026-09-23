@@ -64,6 +64,18 @@ export interface ContextOptions {
   label: string;
 }
 
+/**
+ * A single playback voice. `targetGain` is the nominal audible gain the voice
+ * was created with (including any loudness monitoring gain). It is tracked
+ * explicitly because `AudioParam.value` is not reliable once an automation
+ * curve has been scheduled.
+ */
+interface PlaybackVoice {
+  readonly node: AudioBufferSourceNode;
+  readonly gain: GainNode | null;
+  readonly targetGain: number;
+}
+
 export class PreviewEngine {
   private static instance: PreviewEngine | null = null;
 
@@ -107,6 +119,10 @@ export class PreviewEngine {
   // Playback nodes
   private currentSourceNode: AudioBufferSourceNode | null = null;
   private currentGainNode: GainNode | null = null;
+  // Nominal (audible) gain of the active voice. AudioParam.value is NOT a
+  // reliable source of truth once setValueCurveAtTime automation is scheduled,
+  // so the engine tracks the intended gain explicitly.
+  private currentTargetGain = 0;
   private playbackStartTime = 0;
   private playbackOffset = 0;
   private isPlaying = false;
@@ -352,11 +368,34 @@ export class PreviewEngine {
 
   setAuditionRegion(region: AuditionRegion): void {
     const duration = this.activeSource?.duration ?? 0;
-    this.auditionRegion = clampRegion(region, duration);
+    const next = clampRegion(region, duration);
+
+    // Ignore no-op updates (e.g. pointer moves that clamp to the same window).
+    if (
+      this.auditionRegion &&
+      Math.abs(this.auditionRegion.startSeconds - next.startSeconds) < 1e-9 &&
+      Math.abs(this.auditionRegion.endSeconds - next.endSeconds) < 1e-9
+    ) {
+      return;
+    }
+
+    this.auditionRegion = next;
     this.prepareDryBuffer();
     this.recomputeMonitoringGains();
     this.maybeScheduleAutoPreview();
-    this.notifyListeners();
+
+    // Changing the region replaces the Dry source buffer. Never let the old
+    // AudioBufferSourceNode keep playing obsolete audio: crossfade to the new
+    // buffer while preserving the audition position.
+    if (this.isPlaying) {
+      if (this.auditionMode === 'dry') {
+        this.restartActiveNode(true);
+      } else {
+        this.notifyListeners();
+      }
+    } else {
+      this.notifyListeners();
+    }
   }
 
   getAuditionLengthMode(): AuditionLengthMode {
@@ -854,7 +893,7 @@ export class PreviewEngine {
     offset: number,
     targetGain: number,
     fadeSeconds: number
-  ): { node: AudioBufferSourceNode; gain: GainNode | null } {
+  ): PlaybackVoice {
     const ctx = this.getAudioContext();
     const node = ctx.createBufferSource();
     node.buffer = buffer;
@@ -885,7 +924,7 @@ export class PreviewEngine {
     };
 
     node.start(0, offset);
-    return { node, gain };
+    return { node, gain, targetGain };
   }
 
   private canCrossfade(): boolean {
@@ -918,6 +957,7 @@ export class PreviewEngine {
     this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
     this.currentSourceNode = null;
     this.currentGainNode = null;
+    this.currentTargetGain = 0;
 
     // Clamp offset to valid duration
     if (this.playbackOffset >= buffer.duration) {
@@ -928,6 +968,7 @@ export class PreviewEngine {
     this.playbackStartTime = ctx.currentTime - this.playbackOffset;
     this.currentSourceNode = voice.node;
     this.currentGainNode = voice.gain;
+    this.currentTargetGain = voice.targetGain;
     this.isPlaying = true;
     this.state = 'playing';
 
@@ -943,6 +984,7 @@ export class PreviewEngine {
     this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
     this.currentSourceNode = null;
     this.currentGainNode = null;
+    this.currentTargetGain = 0;
 
     this.isPlaying = false;
     this.state = 'paused';
@@ -954,6 +996,7 @@ export class PreviewEngine {
     this.disconnectVoice(this.currentSourceNode, this.currentGainNode);
     this.currentSourceNode = null;
     this.currentGainNode = null;
+    this.currentTargetGain = 0;
 
     this.isPlaying = false;
     this.playbackOffset = 0;
@@ -1013,17 +1056,21 @@ export class PreviewEngine {
 
     const oldNode = this.currentSourceNode;
     const oldGain = this.currentGainNode;
+    // Use the voice's tracked nominal gain, never AudioParam.value, which stays
+    // at 0 when the voice was created with a fade-in curve.
+    const oldTargetGain = this.currentTargetGain;
 
     const voice = this.createVoice(buffer, currentOffset, this.getMonitoringGain(), fadeSeconds);
     this.playbackStartTime = ctx.currentTime - currentOffset;
     this.currentSourceNode = voice.node;
     this.currentGainNode = voice.gain;
+    this.currentTargetGain = voice.targetGain;
 
     if (!oldNode) return;
 
     if (fadeSeconds > 0 && oldGain) {
       const now = ctx.currentTime;
-      this.applyFade(oldGain, oldGain.gain.value, 0, now, fadeSeconds);
+      this.applyFade(oldGain, oldTargetGain, 0, now, fadeSeconds);
       const nodeToStop = oldNode;
       const gainToStop = oldGain;
       setTimeout(() => {

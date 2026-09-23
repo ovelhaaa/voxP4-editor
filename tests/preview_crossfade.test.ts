@@ -1,6 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PreviewEngine } from '../src/audio/PreviewEngine';
 import { VocalAudioSource } from '../src/audio/types';
+import { resolveAllParameters } from '../src/domain/resolution';
+
+const fadeAutomations = (gain: any): number =>
+  gain.gain.setValueCurveAtTime.mock.calls.length +
+  gain.gain.linearRampToValueAtTime.mock.calls.length;
+
+const lastCurveStart = (gain: any): number | null => {
+  const calls = gain.gain.setValueCurveAtTime.mock.calls;
+  if (calls.length === 0) return null;
+  return calls[calls.length - 1][0][0];
+};
 
 describe('Preview UX V2: Crossfade transport', () => {
   let engine: PreviewEngine;
@@ -93,6 +104,7 @@ describe('Preview UX V2: Crossfade transport', () => {
     (engine as any).activePlaybackFingerprint = null;
     (engine as any).currentSourceNode = null;
     (engine as any).currentGainNode = null;
+    (engine as any).currentTargetGain = 0;
     (engine as any).pendingAutoFingerprint = null;
     (engine as any).autoPreviewEnabled = false;
     (engine as any).loudnessMatchEnabled = false;
@@ -159,5 +171,141 @@ describe('Preview UX V2: Crossfade transport', () => {
     expect(lastStarted).toBeCloseTo(3.5, 2);
     // The FX buffer allows the full processed duration.
     expect(engine.getPlaybackDuration()).toBeCloseTo(6.0, 5);
+  });
+
+  it('crossfades to the rebuilt dry buffer when the region changes during Dry playback', () => {
+    vi.useFakeTimers();
+    engine.setAuditionMode('dry');
+    engine.play(); // voice 0 plays dry region [0, 5]
+    expect(sources.length).toBe(1);
+    expect(engine.getPlaybackDuration()).toBeCloseTo(5.0, 5);
+
+    ctx.currentTime = 2.0;
+    engine.setAuditionRegion({ startSeconds: 1, endSeconds: 4 }); // new dry region (3 s)
+
+    // A new voice starts from a coherent offset into the rebuilt region.
+    expect(sources.length).toBe(2);
+    expect(sources[1].started[0]).toBeCloseTo(2.0, 2);
+    expect(engine.getPlaybackDuration()).toBeCloseTo(3.0, 5);
+
+    // The old voice is faded, not hard-cut, and released only after the fade.
+    expect(fadeAutomations(gains[0])).toBeGreaterThan(0);
+    expect(sources[0].stopped).toBe(false);
+    vi.advanceTimersByTime(200);
+    expect(sources[0].stopped).toBe(true);
+    expect(sources[1].stopped).toBe(false);
+  });
+
+  it('crossfades every transition in an FX -> Dry -> FX sequence without premature hard cuts', () => {
+    vi.useFakeTimers();
+    engine.play(); // voice 0 (FX/processed)
+    ctx.currentTime = 1.0;
+    engine.setAuditionMode('dry'); // voice 1
+    ctx.currentTime = 2.0;
+    engine.setAuditionMode('processed'); // voice 2
+
+    expect(sources.length).toBe(3);
+    expect(sources[1].started[0]).toBeCloseTo(1.0, 2);
+    expect(sources[2].started[0]).toBeCloseTo(2.0, 2);
+
+    // Both transitions used a fade and neither previous voice was hard-cut yet.
+    expect(fadeAutomations(gains[0])).toBeGreaterThan(0);
+    expect(fadeAutomations(gains[1])).toBeGreaterThan(0);
+    expect(sources[0].stopped).toBe(false);
+    expect(sources[1].stopped).toBe(false);
+
+    vi.advanceTimersByTime(200);
+    expect(sources[0].stopped).toBe(true);
+    expect(sources[1].stopped).toBe(true);
+    expect(sources[2].stopped).toBe(false);
+  });
+
+  it('crossfades consecutive rendered versions A -> B -> C', async () => {
+    vi.useFakeTimers();
+    const contextOptions = { id: 'preset:p1', type: 'preset' as const, label: 'P1' };
+    const paramsFor = (wet: number) =>
+      resolveAllParameters({
+        preset: { id: 'p1', name: 'P1', parameters: { ReverbWet: wet } },
+        currentLevel: 'preset',
+      });
+
+    const renderVersion = async (wet: number): Promise<void> => {
+      const params = paramsFor(wet);
+      engine.updateRequestedContext(contextOptions, params);
+      const promise = engine.requestRender(contextOptions, params);
+      promise.catch(() => {});
+      const task = (engine as any).currentTask;
+      (engine as any).handleRenderSuccess({
+        taskId: task.taskId,
+        cacheKey: task.cacheKey,
+        contextFingerprint: task.contextFingerprint,
+        left: new Float32Array(6 * 48000),
+        right: new Float32Array(6 * 48000),
+        duration: 6.0,
+        tailDurationSeconds: 0,
+        renderTimeMs: 5,
+      });
+      await promise;
+    };
+
+    await renderVersion(0.2); // A
+    engine.play(); // voice 0 plays A
+    ctx.currentTime = 1.0;
+    await renderVersion(0.5); // B replaces A -> voice 1
+    ctx.currentTime = 2.0;
+    await renderVersion(0.8); // C replaces B -> voice 2
+
+    expect(sources.length).toBe(3);
+    expect(sources[1].started[0]).toBeCloseTo(1.0, 2);
+    expect(sources[2].started[0]).toBeCloseTo(2.0, 2);
+
+    // A -> B and B -> C each crossfaded; no premature hard cuts.
+    expect(fadeAutomations(gains[0])).toBeGreaterThan(0);
+    expect(fadeAutomations(gains[1])).toBeGreaterThan(0);
+    expect(sources[0].stopped).toBe(false);
+    expect(sources[1].stopped).toBe(false);
+
+    vi.advanceTimersByTime(200);
+    expect(sources[0].stopped).toBe(true);
+    expect(sources[1].stopped).toBe(true);
+    expect(sources[2].stopped).toBe(false);
+  });
+
+  it('fades out from the tracked nominal gain (loudness match), not AudioParam.value', () => {
+    vi.useFakeTimers();
+
+    // Dry is loud (0.2), processed is quiet (0.05) -> +6 dB FX monitoring gain.
+    (engine as any).renderedAudio = {
+      sourceId: 'xfade-source',
+      cacheKey: 'k2',
+      fingerprint: 'fp2',
+      duration: 6.0,
+      tailDurationSeconds: 0,
+      sampleRate: 48000,
+      left: new Float32Array(6 * 48000).fill(0.05),
+      right: new Float32Array(6 * 48000).fill(0.05),
+      renderTimeMs: 10,
+    };
+    engine.setLoudnessMatch(true);
+    const fxGain = engine.getStatus().fxMonitoringGain;
+    expect(fxGain).toBeGreaterThan(1.5);
+
+    // Start on Dry, then crossfade to FX so voice 1 is created WITH a fade-in
+    // automation. Its AudioParam.value therefore stays 0 while it is audibly
+    // playing at fxGain.
+    engine.setAuditionMode('dry');
+    engine.play(); // voice 0 (Dry)
+    ctx.currentTime = 0.5;
+    engine.setAuditionMode('processed'); // voice 1 (FX, fade-in, targetGain = fxGain)
+    expect(gains[1].gain.value).toBe(0);
+
+    // Crossfade back to Dry. The old FX voice must fade out from its nominal
+    // targetGain, not from the unusable 0.
+    ctx.currentTime = 1.0;
+    engine.setAuditionMode('dry');
+
+    const fadeOutStart = lastCurveStart(gains[1]);
+    expect(fadeOutStart).not.toBeNull();
+    expect(fadeOutStart!).toBeCloseTo(fxGain, 3);
   });
 });
