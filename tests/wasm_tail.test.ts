@@ -6,6 +6,8 @@ import {
   estimateMaxTailSeconds,
   estimateMinTailCheckSeconds,
   estimateMinSilenceSeconds,
+  resolveEffectiveDelayTimes,
+  SUBDIVISION_INDEX,
   BLOCK_SIZE,
   SAMPLE_RATE,
 } from '../src/audio/tailEstimation';
@@ -59,9 +61,12 @@ describe('Worker tail algorithm + real WASM DSP', () => {
 
   function runScenario(
     params: Record<string, number>,
-    inputFrames: number,
+    inputOrFrames: number | Float32Array,
     maxTailOverride?: number
   ) {
+    const input = typeof inputOrFrames === 'number' ? syntheticInput(inputOrFrames) : inputOrFrames;
+    const inputFrames = input.length;
+
     resetParams();
     for (const [key, value] of Object.entries(params)) {
       if (!setParam(key, value)) {
@@ -70,7 +75,6 @@ describe('Worker tail algorithm + real WASM DSP', () => {
     }
     resetDsp();
 
-    const input = syntheticInput(inputFrames);
     const bytes = inputFrames * 4;
     const inPtr = mod._malloc(bytes);
     const outLPtr = mod._malloc(bytes);
@@ -80,6 +84,9 @@ describe('Worker tail algorithm + real WASM DSP', () => {
     const primaryOk = render(inPtr, inputFrames, outLPtr, outRPtr);
     const sourceL = new Float32Array(
       mod.HEAPF32.subarray(outLPtr >> 2, (outLPtr >> 2) + inputFrames)
+    );
+    const sourceR = new Float32Array(
+      mod.HEAPF32.subarray(outRPtr >> 2, (outRPtr >> 2) + inputFrames)
     );
 
     const zeroBytes = BLOCK_SIZE * 4;
@@ -109,7 +116,41 @@ describe('Worker tail algorithm + real WASM DSP', () => {
     mod._free(tailLPtr);
     mod._free(tailRPtr);
 
-    return { sourceL, tail, primaryOk };
+    return { sourceL, sourceR, tail, primaryOk, inputFrames };
+  }
+
+  /** Concatenates the primary output and the captured tail for analysis. */
+  function assembleFull(source: Float32Array, tail: Float32Array | null): Float32Array {
+    const tailFrames = tail ? tail.length : 0;
+    const full = new Float32Array(source.length + tailFrames);
+    full.set(source, 0);
+    if (tail) full.set(tail, source.length);
+    return full;
+  }
+
+  /** Returns the time (seconds) of the maximum |sample| inside [startSec, endSec). */
+  function peakTime(samples: Float32Array, startSec: number, endSec: number): number {
+    const start = Math.max(0, Math.floor(startSec * SAMPLE_RATE));
+    const end = Math.min(samples.length, Math.ceil(endSec * SAMPLE_RATE));
+    let best = -1;
+    let bestValue = -1;
+    for (let i = start; i < end; i++) {
+      const value = Math.abs(samples[i]);
+      if (value > bestValue) {
+        bestValue = value;
+        best = i;
+      }
+    }
+    return best < 0 ? -1 : best / SAMPLE_RATE;
+  }
+
+  /** Peak absolute amplitude inside [startSec, endSec). */
+  function windowEnergy(samples: Float32Array, startSec: number, endSec: number): number {
+    const start = Math.max(0, Math.floor(startSec * SAMPLE_RATE));
+    const end = Math.min(samples.length, Math.ceil(endSec * SAMPLE_RATE));
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += Math.abs(samples[i]);
+    return sum;
   }
 
   it('Dry chain produces a minimal tail', () => {
@@ -167,5 +208,117 @@ describe('Worker tail algorithm + real WASM DSP', () => {
       secondRepeatEnergy += Math.abs(tail!.left[i]);
     }
     expect(secondRepeatEnergy).toBeGreaterThan(0);
+  });
+
+  it('Delay BPM sync places echoes at subdivision times and ignores manual ms', () => {
+    const impulse = new Float32Array(64);
+    impulse[0] = 1.0;
+
+    const synced = runScenario(
+      {
+        ...ALL_OFF,
+        'delay.enable': 1,
+        'delay.wet': 1.0,
+        'delay.dry': 0,
+        'delay.feedback': 0,
+        'delay.sync_enable': 1,
+        'tempo.bpm': 120,
+        'delay.left_subdivision': SUBDIVISION_INDEX.Eighth, // 250 ms
+        'delay.right_subdivision': SUBDIVISION_INDEX.DottedEighth, // 375 ms
+        'delay.left_ms': 100, // deliberately wrong, must be ignored
+        'delay.right_ms': 100,
+        'output.spatial_routing': 0,
+      },
+      impulse,
+      1.0
+    );
+
+    const effective = resolveEffectiveDelayTimes({
+      ...ALL_OFF,
+      'delay.sync_enable': 1,
+      'tempo.bpm': 120,
+      'delay.left_subdivision': SUBDIVISION_INDEX.Eighth,
+      'delay.right_subdivision': SUBDIVISION_INDEX.DottedEighth,
+    });
+    expect(effective.leftMs).toBeCloseTo(250, 3);
+    expect(effective.rightMs).toBeCloseTo(375, 3);
+
+    const fullL = assembleFull(synced.sourceL, synced.tail ? synced.tail.left : null);
+    const fullR = assembleFull(synced.sourceR, synced.tail ? synced.tail.right : null);
+
+    const leftEcho = peakTime(fullL, 0.18, 0.32);
+    const rightEcho = peakTime(fullR, 0.3, 0.45);
+    expect(leftEcho).toBeGreaterThan(0.225);
+    expect(leftEcho).toBeLessThan(0.275);
+    expect(rightEcho).toBeGreaterThan(0.35);
+    expect(rightEcho).toBeLessThan(0.4);
+
+    // The manual 100 ms times were not used: no significant echo there.
+    expect(windowEnergy(fullL, 0.07, 0.13)).toBeLessThan(windowEnergy(fullL, 0.22, 0.28));
+    expect(windowEnergy(fullR, 0.07, 0.13)).toBeLessThan(windowEnergy(fullR, 0.34, 0.4));
+  });
+
+  it('Delay sync disabled uses the manual left/right times', () => {
+    const impulse = new Float32Array(64);
+    impulse[0] = 1.0;
+
+    const manual = runScenario(
+      {
+        ...ALL_OFF,
+        'delay.enable': 1,
+        'delay.wet': 1.0,
+        'delay.feedback': 0,
+        'delay.sync_enable': 0,
+        'delay.left_ms': 100,
+        'delay.right_ms': 150,
+        'output.spatial_routing': 0,
+      },
+      impulse,
+      1.0
+    );
+
+    const fullL = assembleFull(manual.sourceL, manual.tail ? manual.tail.left : null);
+    const fullR = assembleFull(manual.sourceR, manual.tail ? manual.tail.right : null);
+
+    const leftEcho = peakTime(fullL, 0.07, 0.14);
+    const rightEcho = peakTime(fullR, 0.12, 0.2);
+    expect(leftEcho).toBeGreaterThan(0.075);
+    expect(leftEcho).toBeLessThan(0.135);
+    expect(rightEcho).toBeGreaterThan(0.125);
+    expect(rightEcho).toBeLessThan(0.195);
+  });
+
+  it('DelayIntoReverb serial routing produces a longer tail than Parallel', () => {
+    // A single late delay echo (feedback 0) re-excites a 2 s reverb tank in the
+    // serial routing, while in Parallel that echo never reaches the reverb.
+    const common: Record<string, number> = {
+      ...ALL_OFF,
+      'delay.enable': 1,
+      'delay.wet': 0.9,
+      'delay.left_ms': 1000,
+      'delay.right_ms': 1000,
+      'delay.feedback': 0,
+      'reverb.enable': 1,
+      'reverb.wet': 0.7,
+      'reverb.decay_s': 2.0,
+    };
+
+    const parallel = runScenario({ ...common, 'output.spatial_routing': 0 }, Math.round(0.4 * SAMPLE_RATE), 10);
+    const serial = runScenario({ ...common, 'output.spatial_routing': 1 }, Math.round(0.4 * SAMPLE_RATE), 10);
+
+    expect(parallel.tail).not.toBeNull();
+    expect(serial.tail).not.toBeNull();
+
+    // The serial chain re-excites the reverb with the delayed repeat, so its real
+    // tail must exceed the parallel (pure max) tail by roughly one delay period.
+    expect(serial.tail!.tailDurationSeconds).toBeGreaterThan(
+      parallel.tail!.tailDurationSeconds + 0.5
+    );
+
+    // Sanity: the estimator also predicts a larger cap for the serial case.
+    const serialEstimate = estimateMaxTailSeconds({ ...common, 'output.spatial_routing': 1 });
+    expect(serialEstimate).toBeGreaterThan(
+      estimateMaxTailSeconds({ ...common, 'output.spatial_routing': 0 })
+    );
   });
 });

@@ -33,6 +33,63 @@ export const MIN_SILENCE_SECONDS = 0.25;
 /** Extra guard after the configured delay time before declaring silence. */
 export const DELAY_SILENCE_GUARD_SECONDS = 0.1;
 
+/** Physical maximum delay time; mirrors VOCAL_FX_MAX_DELAY_SECONDS (2.0 s) in voxP4. */
+export const MAX_DELAY_MS = 2000;
+/** StereoDelay::set_times clamps the delay to at least one sample. */
+export const MIN_DELAY_MS = 1000 / SAMPLE_RATE;
+
+/** Tempo clamp; mirrors tempo_clamp_bpm()/TEMPO_BPM_MIN/MAX in voxP4. */
+export const MIN_TEMPO_BPM = 30;
+export const MAX_TEMPO_BPM = 300;
+export const DEFAULT_TEMPO_BPM = 120;
+
+/** Canonical subdivision order; matches the V1 contract and the C++ enum. */
+export const TEMPO_SUBDIVISION_NAMES = [
+  'Whole',
+  'Half',
+  'Quarter',
+  'Eighth',
+  'Sixteenth',
+  'ThirtySecond',
+  'DottedHalf',
+  'DottedQuarter',
+  'DottedEighth',
+  'DottedSixteenth',
+  'TripletQuarter',
+  'TripletEighth',
+  'TripletSixteenth',
+] as const;
+
+/** Ratios relative to a quarter note; mirrors tempo_subdivision_ratio() in voxP4. */
+export const TEMPO_SUBDIVISION_RATIOS = [
+  4.0,
+  2.0,
+  1.0,
+  0.5,
+  0.25,
+  0.125,
+  3.0,
+  1.5,
+  0.75,
+  0.375,
+  2.0 / 3.0,
+  1.0 / 3.0,
+  1.0 / 6.0,
+] as const;
+
+/** Name -> canonical index map for readability in tests and callers. */
+export const SUBDIVISION_INDEX: Readonly<Record<string, number>> = TEMPO_SUBDIVISION_NAMES.reduce(
+  (acc, name, index) => {
+    acc[name] = index;
+    return acc;
+  },
+  {} as Record<string, number>
+);
+
+/** Spatial routing values; mirrors SpatialFxRouting in voxP4. */
+export const SPATIAL_ROUTING_PARALLEL = 0;
+export const SPATIAL_ROUTING_DELAY_INTO_REVERB = 1;
+
 const WET_EPSILON = 1e-4;
 const FEEDBACK_EPSILON = 1e-4;
 
@@ -43,6 +100,86 @@ function readNumber(parameters: Record<string, number>, key: string, fallback: n
 
 function isEnabled(parameters: Record<string, number>, key: string): boolean {
   return readNumber(parameters, key, 0) > 0.5;
+}
+
+/**
+ * Clamps BPM exactly like the DSP (tempo_clamp_bpm): non-finite -> default,
+ * otherwise bounded to [MIN_TEMPO_BPM, MAX_TEMPO_BPM].
+ */
+export function clampTempoBpm(bpm: number): number {
+  if (!Number.isFinite(bpm)) return DEFAULT_TEMPO_BPM;
+  if (bpm < MIN_TEMPO_BPM) return MIN_TEMPO_BPM;
+  if (bpm > MAX_TEMPO_BPM) return MAX_TEMPO_BPM;
+  return bpm;
+}
+
+/**
+ * Ratio for a subdivision index. Invalid indices fall back to Quarter (1.0),
+ * matching the default branch of tempo_subdivision_ratio() in the DSP.
+ */
+export function tempoSubdivisionRatio(subdivision: number): number {
+  if (!Number.isFinite(subdivision)) return 1.0;
+  const index = Math.round(subdivision);
+  if (index < 0 || index >= TEMPO_SUBDIVISION_RATIOS.length) return 1.0;
+  return TEMPO_SUBDIVISION_RATIOS[index];
+}
+
+/**
+ * Duration in milliseconds of a subdivision at the given BPM.
+ * Mirrors tempo_subdivision_ms() in voxP4.
+ */
+export function tempoSubdivisionMs(bpm: number, subdivision: number): number {
+  return (60000 / clampTempoBpm(bpm)) * tempoSubdivisionRatio(subdivision);
+}
+
+export interface EffectiveDelayTimes {
+  leftMs: number;
+  rightMs: number;
+  maxMs: number;
+}
+
+function clampDelayMs(ms: number): number {
+  if (!Number.isFinite(ms)) return MIN_DELAY_MS;
+  return Math.min(Math.max(ms, MIN_DELAY_MS), MAX_DELAY_MS);
+}
+
+/**
+ * Resolves the delay times actually used by the DSP.
+ *
+ * When `delay.sync_enable` is active the DSP ignores the manual
+ * `delay.left_ms` / `delay.right_ms` values and derives the times from
+ * `tempo.bpm` and the left/right subdivisions (vocal_fx.cpp update_delay_times).
+ * Both paths are clamped to the physical delay-line range exactly like
+ * StereoDelay::set_times().
+ */
+export function resolveEffectiveDelayTimes(parameters: Record<string, number>): EffectiveDelayTimes {
+  let leftMs: number;
+  let rightMs: number;
+
+  if (isEnabled(parameters, 'delay.sync_enable')) {
+    const bpm = readNumber(parameters, 'tempo.bpm', DEFAULT_TEMPO_BPM);
+    leftMs = tempoSubdivisionMs(bpm, readNumber(parameters, 'delay.left_subdivision', 0));
+    rightMs = tempoSubdivisionMs(bpm, readNumber(parameters, 'delay.right_subdivision', 0));
+  } else {
+    leftMs = readNumber(parameters, 'delay.left_ms', 0);
+    rightMs = readNumber(parameters, 'delay.right_ms', 0);
+  }
+
+  const clampedLeft = clampDelayMs(leftMs);
+  const clampedRight = clampDelayMs(rightMs);
+  return { leftMs: clampedLeft, rightMs: clampedRight, maxMs: Math.max(clampedLeft, clampedRight) };
+}
+
+/**
+ * True when the spatial routing sends the delay wet signal into the reverb
+ * input (SpatialFxRouting::DelayIntoReverb). The DSP send is exactly 1.0 for
+ * this routing. Missing routing defaults to the contract default (serial).
+ */
+export function isDelayIntoReverb(parameters: Record<string, number>): boolean {
+  const routing = Math.round(
+    readNumber(parameters, 'output.spatial_routing', SPATIAL_ROUTING_DELAY_INTO_REVERB)
+  );
+  return routing === SPATIAL_ROUTING_DELAY_INTO_REVERB;
 }
 
 /**
@@ -63,11 +200,8 @@ export function estimateMaxTailSeconds(parameters: Record<string, number>): numb
   if (isEnabled(parameters, 'delay.enable')) {
     const wet = readNumber(parameters, 'delay.wet', 0);
     const feedback = Math.abs(readNumber(parameters, 'delay.feedback', 0));
-    const maxDelaySeconds =
-      Math.max(
-        readNumber(parameters, 'delay.left_ms', 0),
-        readNumber(parameters, 'delay.right_ms', 0)
-      ) / 1000;
+    // Use the DSP-effective delay times (BPM sync aware, physically clamped).
+    const maxDelaySeconds = resolveEffectiveDelayTimes(parameters).maxMs / 1000;
 
     if (wet > WET_EPSILON && maxDelaySeconds > 0) {
       let repeats: number;
@@ -83,7 +217,16 @@ export function estimateMaxTailSeconds(parameters: Record<string, number>): numb
     }
   }
 
-  const estimated = Math.max(MIN_TAIL_SECONDS, reverbTail, delayTail);
+  // When routing is serial (DelayIntoReverb), the last audible delay repeat can
+  // excite the reverb tank again, so the worst case is the sum of both tails.
+  // Only apply this when both effects actually produce a tail.
+  const bothActive = delayTail > 0 && reverbTail > 0;
+  const serial = bothActive && isDelayIntoReverb(parameters);
+  const combined = serial
+    ? Math.max(delayTail, reverbTail, delayTail + reverbTail)
+    : Math.max(delayTail, reverbTail);
+
+  const estimated = Math.max(MIN_TAIL_SECONDS, combined);
   return Math.min(estimated, MAX_ALLOWED_TAIL_SECONDS);
 }
 
@@ -95,11 +238,7 @@ export function estimateMaxTailSeconds(parameters: Record<string, number>): numb
 export function estimateMinTailCheckSeconds(parameters: Record<string, number>): number {
   if (isEnabled(parameters, 'delay.enable')) {
     const wet = readNumber(parameters, 'delay.wet', 0);
-    const maxDelaySeconds =
-      Math.max(
-        readNumber(parameters, 'delay.left_ms', 0),
-        readNumber(parameters, 'delay.right_ms', 0)
-      ) / 1000;
+    const maxDelaySeconds = resolveEffectiveDelayTimes(parameters).maxMs / 1000;
 
     if (wet > WET_EPSILON && maxDelaySeconds > 0) {
       return Math.max(MIN_TAIL_CHECK_SECONDS, maxDelaySeconds + DELAY_SILENCE_GUARD_SECONDS);
@@ -119,11 +258,7 @@ export function estimateMinTailCheckSeconds(parameters: Record<string, number>):
 export function estimateMinSilenceSeconds(parameters: Record<string, number>): number {
   if (isEnabled(parameters, 'delay.enable')) {
     const wet = readNumber(parameters, 'delay.wet', 0);
-    const maxDelaySeconds =
-      Math.max(
-        readNumber(parameters, 'delay.left_ms', 0),
-        readNumber(parameters, 'delay.right_ms', 0)
-      ) / 1000;
+    const maxDelaySeconds = resolveEffectiveDelayTimes(parameters).maxMs / 1000;
 
     if (wet > WET_EPSILON && maxDelaySeconds > 0) {
       return Math.max(MIN_SILENCE_SECONDS, maxDelaySeconds + DELAY_SILENCE_GUARD_SECONDS);

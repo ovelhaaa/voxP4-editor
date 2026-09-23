@@ -11,14 +11,27 @@ import { captureTail } from './tailProcessor';
 /**
  * Preview Web Worker
  *
- * NOTE ON WORKER CANCELLATION SEMANTICS:
- * Because WebAssembly execution via Emscripten runs synchronously on the Worker thread,
- * postMessage({ type: 'CANCEL' }) cannot preemptively interrupt an in-progress
- * voxp4_preview_render(...) loop mid-call.
- * Instead, cancellation is checked immediately before WASM execution, during tail block
- * processing, and prior to returning results.
- * Any superseded or cancelled task discards its buffers, frees WASM memory, and sends
- * no state mutation to the main thread.
+ * CANCELLATION IS LOGICAL, NOT PREEMPTIVE.
+ *
+ * The Worker renders synchronously inside WASM (`voxp4_preview_render`) and inside
+ * the `captureTail()` block loop. While that synchronous JS/WASM work is running,
+ * the Worker cannot service new messages: `postMessage({ type: 'CANCEL' })` is only
+ * observed when control returns to the Worker event loop (i.e. between the
+ * cooperative check points below). It does NOT interrupt a `render()` call or a
+ * block mid-execution, and it does NOT abort the currently executing WASM.
+ *
+ * The main thread remains authoritative:
+ *   - a newer request supersedes the pending task and rejects its Promise;
+ *   - the superseded task's result is ignored even if it finishes later;
+ *   - the Worker may keep burning CPU on the stale render until the synchronous
+ *     section returns.
+ *
+ * Cancellation is checked cooperatively: immediately before WASM execution,
+ * between tail blocks via `captureTail({ shouldAbort })`, and before posting
+ * results. A discarded task frees its WASM memory and posts no state mutation.
+ *
+ * This is an accepted limitation of the synchronous render model; chunked/yielding
+ * rendering is intentionally out of scope.
  */
 
 interface WorkerRenderRequest {
