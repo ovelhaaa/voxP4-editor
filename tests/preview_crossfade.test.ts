@@ -108,6 +108,8 @@ describe('Preview UX V2: Crossfade transport', () => {
     (engine as any).pendingAutoFingerprint = null;
     (engine as any).autoPreviewEnabled = false;
     (engine as any).loudnessMatchEnabled = false;
+    (engine as any).auditionLengthMode = 'full';
+    (engine as any).auditionRegion = null;
     (engine as any).listeners.clear();
     (engine as any).clockListeners.clear();
 
@@ -183,9 +185,10 @@ describe('Preview UX V2: Crossfade transport', () => {
     ctx.currentTime = 2.0;
     engine.setAuditionRegion({ startSeconds: 1, endSeconds: 4 }); // new dry region (3 s)
 
-    // A new voice starts from a coherent offset into the rebuilt region.
+    // Absolute source time (2.0 s) is preserved: new region starts at 1.0 s,
+    // so the new voice starts 1.0 s into the rebuilt region.
     expect(sources.length).toBe(2);
-    expect(sources[1].started[0]).toBeCloseTo(2.0, 2);
+    expect(sources[1].started[0]).toBeCloseTo(1.0, 2);
     expect(engine.getPlaybackDuration()).toBeCloseTo(3.0, 5);
 
     // The old voice is faded, not hard-cut, and released only after the fade.
@@ -307,5 +310,75 @@ describe('Preview UX V2: Crossfade transport', () => {
     const fadeOutStart = lastCurveStart(gains[1]);
     expect(fadeOutStart).not.toBeNull();
     expect(fadeOutStart!).toBeCloseTo(fxGain, 3);
+  });
+
+  it('maps absolute source time across region changes (0->5 @ t=2, new 1->4 => offset 1)', () => {
+    vi.useFakeTimers();
+    engine.setAuditionMode('dry');
+    engine.play(); // region [0,5], offset 0
+    ctx.currentTime = 2.0;
+
+    engine.setAuditionRegion({ startSeconds: 1, endSeconds: 4 });
+
+    expect(sources[1].started[0]).toBeCloseTo(1.0, 3);
+  });
+
+  it('clamps to 0 when the absolute position falls before the new region', () => {
+    vi.useFakeTimers();
+    (engine as any).setActiveSource(createMockSource(12.0));
+    engine.setAuditionMode('dry');
+    engine.play();
+    ctx.currentTime = 1.0; // absolute source time = 1.0 s
+
+    engine.setAuditionRegion({ startSeconds: 5, endSeconds: 9 });
+
+    expect(sources[1].started[0]).toBeCloseTo(0, 3);
+  });
+
+  it('clamps near the end when the absolute position falls after the new region', () => {
+    vi.useFakeTimers();
+    (engine as any).setActiveSource(createMockSource(12.0));
+    engine.setAuditionMode('dry');
+    engine.play();
+    ctx.currentTime = 8.0; // absolute source time = 8.0 s
+
+    engine.setAuditionRegion({ startSeconds: 0, endSeconds: 3 });
+
+    const started = sources[1].started[0];
+    expect(started).toBeGreaterThan(2.9);
+    expect(started).toBeLessThan(3.0);
+    expect(engine.getPlaybackDuration()).toBeCloseTo(3.0, 5);
+  });
+
+  it('preserves absolute time with Quick Audition and clamps when the window shrinks', () => {
+    vi.useFakeTimers();
+    (engine as any).setActiveSource(createMockSource(12.0));
+
+    engine.setAuditionLengthMode('medium'); // effective [0,8]
+    engine.setAuditionMode('dry');
+    engine.play();
+    ctx.currentTime = 7.5; // absolute source time = 7.5 s
+
+    engine.setAuditionLengthMode('short'); // effective [0,3]
+
+    const started = sources[1].started[0];
+    expect(started).toBeGreaterThan(2.9);
+    expect(started).toBeLessThan(3.0);
+    expect(engine.getPlaybackDuration()).toBeCloseTo(3.0, 5);
+  });
+
+  it('preserves in-range absolute time when the Quick Audition window grows', () => {
+    vi.useFakeTimers();
+    (engine as any).setActiveSource(createMockSource(12.0));
+
+    engine.setAuditionLengthMode('short'); // effective [0,3]
+    engine.setAuditionMode('dry');
+    engine.play();
+    ctx.currentTime = 1.0; // absolute source time = 1.0 s
+
+    engine.setAuditionLengthMode('full'); // effective [0,12]
+
+    expect(sources[1].started[0]).toBeCloseTo(1.0, 3);
+    expect(engine.getPlaybackDuration()).toBeCloseTo(12.0, 5);
   });
 });

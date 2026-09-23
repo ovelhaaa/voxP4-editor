@@ -35,7 +35,14 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
 
   const [width, setWidth] = useState(0);
 
+  // During a drag we only move this local "draft" region; the committed region
+  // reaches the engine exactly once, on pointer up. This prevents a crossfade
+  // storm while scrubbing the region.
+  const [draftRegion, setDraftRegion] = useState<AuditionRegion | null>(null);
+  const draftRegionRef = useRef<AuditionRegion | null>(null);
+
   const duration = durationSeconds > 0 ? durationSeconds : 0;
+  const displayRegion = draftRegion ?? region;
 
   // `samples` can be a subarray/view; identity is stable per decoded source.
   const envelope = useMemo(
@@ -85,10 +92,10 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
     const mid = height / 2;
     const amp = height * 0.42;
 
-    // Region shading
-    if (region) {
-      const x0 = secondsToX(region.startSeconds);
-      const x1 = secondsToX(region.endSeconds);
+    // Region shading (draft region while dragging, committed region otherwise)
+    if (displayRegion) {
+      const x0 = secondsToX(displayRegion.startSeconds);
+      const x1 = secondsToX(displayRegion.endSeconds);
       ctx.fillStyle = 'rgba(244, 81, 38, 0.10)';
       ctx.fillRect(x0, 0, Math.max(1, x1 - x0), height);
       ctx.fillStyle = 'rgba(244, 81, 38, 0.55)';
@@ -123,14 +130,14 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
     ctx.fillRect(0, mid, width, 1);
 
     // Handles
-    if (region) {
+    if (displayRegion) {
       ctx.fillStyle = '#F45126';
-      const hx0 = secondsToX(region.startSeconds);
-      const hx1 = secondsToX(region.endSeconds);
+      const hx0 = secondsToX(displayRegion.startSeconds);
+      const hx1 = secondsToX(displayRegion.endSeconds);
       ctx.fillRect(hx0 - 1, 0, 3, height);
       ctx.fillRect(hx1 - 2, 0, 3, height);
     }
-  }, [width, duration, region, effectiveRegion, envelope, secondsToX]);
+  }, [width, duration, displayRegion, effectiveRegion, envelope, secondsToX]);
 
   // Redraw only the playhead on the overlay canvas (cheap, high frequency).
   useEffect(() => {
@@ -198,6 +205,16 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
     e.preventDefault();
   };
 
+  const updateDraft = (next: AuditionRegion) => {
+    draftRegionRef.current = next;
+    setDraftRegion(next);
+  };
+
+  const clearDraft = () => {
+    draftRegionRef.current = null;
+    setDraftRegion(null);
+  };
+
   const handlePointerMove = (e: React.PointerEvent) => {
     const drag = dragRef.current;
     if (!drag) return;
@@ -206,42 +223,64 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
 
     const seconds = xToSeconds(x);
 
+    // Only the local visual region is updated during the drag.
     if (drag.mode === 'start') {
-      const next = clampRegion(
-        { startSeconds: Math.min(seconds, drag.baseRegion.endSeconds), endSeconds: drag.baseRegion.endSeconds },
-        duration
+      updateDraft(
+        clampRegion(
+          {
+            startSeconds: Math.min(seconds, drag.baseRegion.endSeconds),
+            endSeconds: drag.baseRegion.endSeconds,
+          },
+          duration
+        )
       );
-      onRegionChange(next);
     } else if (drag.mode === 'end') {
-      const next = clampRegion(
-        { startSeconds: drag.baseRegion.startSeconds, endSeconds: Math.max(seconds, drag.baseRegion.startSeconds) },
-        duration
+      updateDraft(
+        clampRegion(
+          {
+            startSeconds: drag.baseRegion.startSeconds,
+            endSeconds: Math.max(seconds, drag.baseRegion.startSeconds),
+          },
+          duration
+        )
       );
-      onRegionChange(next);
     } else if (drag.mode === 'move') {
       const length = drag.baseRegion.endSeconds - drag.baseRegion.startSeconds;
       const delta = seconds - drag.anchorSeconds;
       let start = drag.baseRegion.startSeconds + delta;
       start = Math.max(0, Math.min(duration - length, start));
-      onRegionChange({ startSeconds: start, endSeconds: start + length });
+      updateDraft({ startSeconds: start, endSeconds: start + length });
     } else if (drag.mode === 'select') {
-      const next = clampRegion(
-        { startSeconds: drag.anchorSeconds, endSeconds: seconds },
-        duration
+      updateDraft(
+        clampRegion({ startSeconds: drag.anchorSeconds, endSeconds: seconds }, duration)
       );
-      onRegionChange(next);
     }
   };
 
-  const endDrag = (e: React.PointerEvent) => {
+  const handlePointerUp = (e: React.PointerEvent) => {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
     (e.target as Element).releasePointerCapture?.(e.pointerId);
 
+    // A plain click repositions the playhead; a drag commits the new region once.
     if (drag.mode === 'select' && !drag.moved) {
+      clearDraft();
       onSeek(drag.anchorSeconds);
+      return;
     }
+
+    const committed = draftRegionRef.current;
+    clearDraft();
+    if (committed) {
+      onRegionChange(committed);
+    }
+  };
+
+  const handlePointerCancel = (e: React.PointerEvent) => {
+    dragRef.current = null;
+    clearDraft();
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
   };
 
   return (
@@ -250,8 +289,8 @@ export const AuditionWaveform: React.FC<AuditionWaveformProps> = ({
       className="relative w-full h-16 bg-[#0C0D12] border border-[#292A30] rounded-[4px] overflow-hidden cursor-crosshair select-none touch-none"
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
       role="slider"
       aria-label="Audition waveform"
       aria-valuemin={0}

@@ -135,7 +135,7 @@ Builds the strictly typed, optimized single-page application into `dist/`.
 ```bash
 npm test
 ```
-Executes all 25 test suites (158 unit and integration tests) using Vitest.
+Executes all 27 test suites (170 unit and integration tests) using Vitest.
 
 ### Update Contracts
 ```bash

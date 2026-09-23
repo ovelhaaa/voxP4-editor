@@ -119,10 +119,14 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
       }
 
       // 2. Apply resolved parameter values with strict validation
-      for (const [key, value] of Object.entries(parameters)) {
+      const parameterEntries = Object.entries(parameters);
+      for (let index = 0; index < parameterEntries.length; index++) {
+        const [key, value] = parameterEntries[index];
         const ok = setParameter(key, value);
         if (!ok) {
-          throw new Error(`DSP rejected parameter: ${key}`);
+          throw new Error(
+            `DSP rejected parameter ${index + 1}/${parameterEntries.length}: ${key}`
+          );
         }
       }
 

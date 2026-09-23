@@ -28,6 +28,11 @@ import compatibilityManifest from './wasm/dsp-compatibility.json';
 export const DEFAULT_CROSSFADE_SECONDS = 0.05;
 /** Auto Preview debounce window (ms). */
 export const DEFAULT_AUTO_PREVIEW_DELAY_MS = 350;
+/**
+ * A restarted voice never begins exactly at the buffer end (which would be
+ * inaudible). Offsets are clamped this far before the end.
+ */
+export const PLAYBACK_END_GUARD_SECONDS = 0.02;
 
 export class RenderSupersededError extends Error {
   constructor(message = 'Preview render was superseded by a newer render request') {
@@ -124,6 +129,10 @@ export class PreviewEngine {
   // so the engine tracks the intended gain explicitly.
   private currentTargetGain = 0;
   private playbackStartTime = 0;
+  // Source-time (seconds into the original file) of the active voice at the
+  // moment it started. Lets region/length changes preserve the absolute
+  // musical position instead of the region-relative offset.
+  private playbackStartSourceTime = 0;
   private playbackOffset = 0;
   private isPlaying = false;
   private timeUpdateInterval: number | null = null;
@@ -965,7 +974,9 @@ export class PreviewEngine {
     }
 
     const voice = this.createVoice(buffer, this.playbackOffset, this.getMonitoringGain(), 0);
+    const region = this.getEffectiveRegion();
     this.playbackStartTime = ctx.currentTime - this.playbackOffset;
+    this.playbackStartSourceTime = region?.startSeconds ?? 0;
     this.currentSourceNode = voice.node;
     this.currentGainNode = voice.gain;
     this.currentTargetGain = voice.targetGain;
@@ -1012,7 +1023,8 @@ export class PreviewEngine {
     this.playbackOffset = Math.max(0, Math.min(seconds, duration));
 
     if (this.isPlaying) {
-      this.restartActiveNode(true);
+      // `playbackOffset` is already region-relative to the current region.
+      this.restartActiveNode(true, this.playbackOffset);
     } else {
       this.notifyClockListeners(this.playbackOffset);
       this.notifyListeners();
@@ -1045,13 +1057,56 @@ export class PreviewEngine {
     this.notifyListeners();
   }
 
-  /** Crossfades (or hard-swaps) the active voice to the current buffer. */
-  private restartActiveNode(crossfade = false): void {
+  /**
+   * Source-time (seconds into the original file) currently being auditioned.
+   * Independent of the region-relative `getCurrentTime()`.
+   */
+  getAbsoluteSourceTime(): number {
+    const region = this.getEffectiveRegion();
+    const regionStart = region?.startSeconds ?? 0;
+
+    if (!this.isPlaying || !this.audioCtx) {
+      return regionStart + this.playbackOffset;
+    }
+
+    const elapsed = this.audioCtx.currentTime - this.playbackStartTime;
+    let absolute = this.playbackStartSourceTime + elapsed;
+
+    const sourceDuration = this.activeSource?.duration ?? 0;
+    if (sourceDuration > 0) {
+      if (this.isLooping) {
+        absolute = absolute % sourceDuration;
+        if (absolute < 0) absolute += sourceDuration;
+      } else {
+        absolute = Math.min(absolute, sourceDuration);
+      }
+    }
+    return Math.max(0, absolute);
+  }
+
+  /**
+   * Crossfades (or hard-swaps) the active voice to the current buffer.
+   *
+   * When `explicitOffset` is omitted the offset is derived from the absolute
+   * source time, so rebuilding the buffer for a new region keeps the audition
+   * at the same musical position in the file.
+   */
+  private restartActiveNode(crossfade = false, explicitOffset?: number): void {
     const buffer = this.getActiveBuffer();
     if (!buffer) return;
 
     const ctx = this.getAudioContext();
-    const currentOffset = Math.min(Math.max(0, this.getCurrentTime()), buffer.duration);
+    const region = this.getEffectiveRegion();
+    const maxOffset = Math.max(0, buffer.duration - PLAYBACK_END_GUARD_SECONDS);
+
+    const rawOffset =
+      explicitOffset !== undefined
+        ? explicitOffset
+        : region
+          ? this.getAbsoluteSourceTime() - region.startSeconds
+          : this.getCurrentTime();
+    const currentOffset = Math.min(Math.max(0, rawOffset), maxOffset);
+
     const fadeSeconds = crossfade && this.canCrossfade() ? this.crossfadeSeconds : 0;
 
     const oldNode = this.currentSourceNode;
@@ -1062,6 +1117,7 @@ export class PreviewEngine {
 
     const voice = this.createVoice(buffer, currentOffset, this.getMonitoringGain(), fadeSeconds);
     this.playbackStartTime = ctx.currentTime - currentOffset;
+    this.playbackStartSourceTime = region?.startSeconds ?? 0;
     this.currentSourceNode = voice.node;
     this.currentGainNode = voice.gain;
     this.currentTargetGain = voice.targetGain;
