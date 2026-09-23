@@ -11,6 +11,10 @@
  *   voxp4-preview.wasm
  *   dsp-compatibility.json
  *
+ * Validation rejects packages whose `manifest.dspCommit` is not a 40-char
+ * lowercase hex commit (so "unknown" is refused) or whose embedded WASM
+ * `dspCommit` differs from the sidecar manifest.
+ *
  * The update is all-or-nothing: the destination ends up either as the complete
  * old package or the complete new package, never a mix. The sequence is:
  *
@@ -27,6 +31,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { isValidCommit, readEmbeddedDspCommit } from './lib/wasm-provenance.mjs';
 
 export const REQUIRED_FILES = ['voxp4-preview.mjs', 'voxp4-preview.wasm', 'dsp-compatibility.json'];
 export const EXPECTED = {
@@ -45,8 +50,11 @@ function sha256(filePath, fsImpl) {
 /**
  * Validates a package directory. Throws an Error on any inconsistency.
  * Returns the parsed manifest on success.
+ *
+ * This is async because it also instantiates the WASM and requires the commit
+ * embedded in the binary to equal `manifest.dspCommit`.
  */
-export function validatePackage(inputDir, contractPath, fsImpl = fs) {
+export async function validatePackage(inputDir, contractPath, fsImpl = fs) {
   if (!fsImpl.existsSync(inputDir) || !fsImpl.statSync(inputDir).isDirectory()) {
     throw new Error(`package directory not found: ${inputDir}`);
   }
@@ -89,8 +97,29 @@ export function validatePackage(inputDir, contractPath, fsImpl = fs) {
     );
   }
 
-  if (typeof manifest.dspCommit !== 'string' || manifest.dspCommit.length === 0) {
-    throw new Error('manifest.dspCommit is missing');
+  if (!isValidCommit(manifest.dspCommit)) {
+    throw new Error(
+      `manifest.dspCommit must be a 40-char lowercase hex git commit ` +
+        `(got ${JSON.stringify(manifest.dspCommit)}); "unknown" is not accepted.`
+    );
+  }
+
+  let embeddedCommit;
+  try {
+    embeddedCommit = await readEmbeddedDspCommit(
+      path.join(inputDir, 'voxp4-preview.mjs'),
+      path.join(inputDir, 'voxp4-preview.wasm'),
+      fsImpl
+    );
+  } catch (err) {
+    throw new Error(`could not inspect the embedded WASM manifest: ${err.message}`);
+  }
+
+  if (embeddedCommit !== manifest.dspCommit) {
+    throw new Error(
+      `embedded dspCommit ${JSON.stringify(embeddedCommit)} does not match ` +
+        `manifest dspCommit ${manifest.dspCommit}`
+    );
   }
 
   return manifest;
@@ -110,8 +139,8 @@ function removeDirQuietly(dir, fsImpl) {
  *
  * @returns {{ manifest: object, updated: string[] }}
  */
-export function runSync({ inputDir, destDir, contractPath, fsImpl = fs, log = console.log, pid = process.pid }) {
-  const manifest = validatePackage(inputDir, contractPath, fsImpl);
+export async function runSync({ inputDir, destDir, contractPath, fsImpl = fs, log = console.log, pid = process.pid }) {
+  const manifest = await validatePackage(inputDir, contractPath, fsImpl);
 
   const parentDir = path.dirname(destDir);
   fsImpl.mkdirSync(parentDir, { recursive: true });
@@ -133,7 +162,7 @@ export function runSync({ inputDir, destDir, contractPath, fsImpl = fs, log = co
     }
 
     // 3. Re-validate the staging copy.
-    validatePackage(stagingDir, contractPath, fsImpl);
+    await validatePackage(stagingDir, contractPath, fsImpl);
 
     // 4. Move the current package out of the way.
     const destExists = fsImpl.existsSync(destDir);
@@ -184,7 +213,7 @@ export function runSync({ inputDir, destDir, contractPath, fsImpl = fs, log = co
   };
 }
 
-function main() {
+async function main() {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.resolve(__dirname, '..');
   const destDir = path.join(repoRoot, 'src', 'audio', 'wasm');
@@ -198,7 +227,7 @@ function main() {
   }
 
   try {
-    const { manifest, updated } = runSync({
+    const { manifest, updated } = await runSync({
       inputDir: path.resolve(inputArg),
       destDir,
       contractPath,
@@ -215,5 +244,8 @@ function main() {
 const invokedDirectly =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
-  main();
+  main().catch((err) => {
+    console.error(`[sync-wasm] ERROR - ${err.message}`);
+    process.exit(1);
+  });
 }

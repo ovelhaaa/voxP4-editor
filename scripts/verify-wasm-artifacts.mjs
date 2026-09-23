@@ -14,6 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { isValidCommit, readEmbeddedDspCommit } from './lib/wasm-provenance.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -92,8 +93,24 @@ if (typeof manifest.contractSha256 !== 'string' || manifest.contractSha256.lengt
   );
 }
 
-if (typeof manifest.dspCommit !== 'string' || manifest.dspCommit.length === 0) {
-  fail('manifest.dspCommit is missing');
+if (!isValidCommit(manifest.dspCommit)) {
+  fail(
+    `manifest.dspCommit must be a 40-char lowercase hex git commit ` +
+      `(got ${JSON.stringify(manifest.dspCommit)}); "unknown" is not accepted`
+  );
+} else {
+  // The sidecar manifest must declare exactly the commit compiled into the WASM.
+  try {
+    const embeddedCommit = await readEmbeddedDspCommit(MJS_PATH, WASM_PATH);
+    if (embeddedCommit !== manifest.dspCommit) {
+      fail(
+        `embedded dspCommit ${JSON.stringify(embeddedCommit)} does not match ` +
+          `manifest.dspCommit ${manifest.dspCommit}`
+      );
+    }
+  } catch (err) {
+    fail(`could not inspect the embedded WASM manifest: ${err.message}`);
+  }
 }
 
 if (failures.length > 0) {
